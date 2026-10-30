@@ -50,6 +50,25 @@ struct SourceMeta {
     arch_id: u32,
 }
 
+// The GGUF arm of this seam. `ModelSource` (hipfire-runtime) is matched
+// exhaustively by dozens of arch carriers, and no carrier can run GGUF weights
+// yet (no ggml kernel is wired), so GGUF is not a `ModelSource` variant:
+// `crate::gguf_native::GgufNativeModel::source_meta` (gated by
+// `HIPFIRE_GGUF_NATIVE=1`, refusing `load refused:` otherwise) produces the
+// same three facts this struct carries. `arch_id` is in the HFQ header
+// namespace (`hipfire_runtime::arch_mapping`, from `general.architecture`),
+// not the `derive_arch_id` directory namespace.
+impl From<crate::gguf_native::GgufSourceMeta> for SourceMeta {
+    fn from(m: crate::gguf_native::GgufSourceMeta) -> Self {
+        SourceMeta {
+            tokenizer: m.tokenizer,
+            chat_template: m.chat_template,
+            chat_template_source: m.chat_template_source,
+            arch_id: m.arch_id,
+        }
+    }
+}
+
 /// Discover a `.vl` sidecar file for the given trunk model path.
 ///
 /// Same resolution the daemon uses (they are one implementation now, in
@@ -675,9 +694,7 @@ impl Carrier for Qwen4Carrier {
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if is_dir {
-            return Err(
-                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-            );
+            return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
         }
         if pp == 0 || pp > QWEN4_PP_MAX {
             return Err(format!(
@@ -824,6 +841,24 @@ impl Carrier for Qwen4Carrier {
         self.admit_options(ctx.draft_path, options)?;
         // Admission checked the draft is present; DFlash2 replaces native MTP.
         let dflash_draft = ctx.draft_path.filter(|_| ctx.spec.dflash == Some(true));
+        if let Some(draft) = dflash_draft {
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOn,
+                format!(
+                    "dflash (draft {})",
+                    std::path::Path::new(draft)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| draft.to_string())
+                ),
+            );
+            if native_mtp {
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOff,
+                    "MTP off: DFlash draft replaces native MTP",
+                );
+            }
+        }
         let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
         let shared = Qwen4RankShared {
@@ -1232,6 +1267,10 @@ fn qwen4_native_mtp_speculator(
     >,
 ) -> Box<dyn hipfire_runtime::spec::Speculator> {
     eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+    hipfire_config::load_summary::note(
+        hipfire_config::load_summary::Facet::SpecOn,
+        format!("qwen4 native mtp K={max_k}"),
+    );
     if hipfire_config::mtp_sampled_enabled()
         && !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn)
     {
@@ -1243,6 +1282,10 @@ fn qwen4_native_mtp_speculator(
     let mut copy_lane = false;
     let ngram = if !ngram_modifier {
         eprintln!("  qwen4 native MTP n-gram: off (topology.pp)");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::CopyLane,
+            "n-gram copy lane off (topology.pp)",
+        );
         None
     } else {
         copy_lane = hipfire_config::mtp_ngram_copy_enabled_for_arch(arch, gpu_arch);
@@ -1257,6 +1300,14 @@ fn qwen4_native_mtp_speculator(
                     config.n_match,
                     config.n_min,
                     config.n_max
+                );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::CopyLane,
+                    if ngram_on && copy_lane {
+                        "n-gram copy lane on"
+                    } else {
+                        "n-gram copy lane off"
+                    },
                 );
                 if ngram_on && copy_lane {
                     eprintln!(
@@ -1956,9 +2007,7 @@ fn plan_qwen4_ep(
         );
     }
     let ModelSource::Hfq(hfq) = src else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
         .map_err(|error| error.to_string())?;
@@ -2286,7 +2335,7 @@ fn qwen4_placement_inputs(
 > {
     // Every placement host-maps at least the MTP layer's routed experts, so
     // the head is still attached after it only where the host-mapped policy
-    // keeps it (exact gfx1201, or an explicit `--spec mtp`); only then does
+    // keeps it (exact gfx1100 or gfx1201, or an explicit `--spec mtp`); only then does
     // it need VRAM.
     let mtp_kept = native_mtp
         && crate::admission::qwen4_mtp_with_host_mapped_experts(
@@ -2758,9 +2807,7 @@ pub fn qwen4_ep_vram_layers(
     batch: &hipfire_runtime::loader_api::BatchLoadRequest,
 ) -> Result<hipfire_arch_qwen4::expert_residency::EpVramPlan, String> {
     let ModelSource::Hfq(hfq) = src else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
     // Logical emulation (`HIPFIRE_EMULATE_GPUS`) aliases every rank onto one
     // device, so a UMA APU (gfx1151) runs it with the per-alias VRAM split.
@@ -4116,7 +4163,16 @@ pub fn load_qwen4_rank(
     session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
 ) -> Result<Qwen4RankLoad, String> {
-    load_qwen4_rank_scoped(gpu, ep_seal, shared, expert_vram_layers, session, src, None)
+    load_qwen4_rank_scoped(
+        gpu,
+        ep_seal,
+        shared,
+        expert_vram_layers,
+        session,
+        src,
+        None,
+        None,
+    )
 }
 
 /// [`load_qwen4_rank`] for one pipeline band (`band == Some`) or the whole
@@ -4131,6 +4187,10 @@ pub fn load_qwen4_rank(
 /// when it is on (`shared.native_mtp`, [`qwen4_rank_native_mtp`]); and the
 /// forward scratch plan is the one chosen from the full manifest so every
 /// band agrees.
+///
+/// `pp_chunk_rows` is the canonical prefill chunk the PP load chose once for
+/// every band and the mesh ([`load_qwen4_pp_bundle`]); a band requires it
+/// and a whole-model load passes `None`.
 fn load_qwen4_rank_scoped(
     gpu: &mut rdna_compute::Gpu,
     ep_seal: Option<hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal>,
@@ -4139,6 +4199,7 @@ fn load_qwen4_rank_scoped(
     session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
     band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
+    pp_chunk_rows: Option<usize>,
 ) -> Result<Qwen4RankLoad, String> {
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
@@ -4192,9 +4253,7 @@ fn load_qwen4_rank_scoped(
         kv_mode: shared.kv_mode.as_str(),
     };
     let ModelSource::Hfq(mut hfq) = src else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
     // The PLE rows source (`memory.ple_format`).  Admission already
     // resolved and attached a sidecar on this source; resolving again is
@@ -4282,6 +4341,13 @@ fn load_qwen4_rank_scoped(
         eprintln!(
             "  qwen4 native MTP: off (profile {} has no MTP head)",
             receipt.config.profile.id()
+        );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            format!(
+                "MTP off: profile {} has no MTP head",
+                receipt.config.profile.id()
+            ),
         );
     }
     if let Some(note) = crate::admission::qwen4_developer_ple_policy(
@@ -4562,13 +4628,23 @@ fn load_qwen4_rank_scoped(
     // device is classified without a copy) and is 8192 only on a narrow
     // discrete link, so the placement cedes resident layers for the wider
     // chunk there. On gfx1201 the default follows the load's scratch plan
-    // (16384 rows under the compact plan, 4096 under `Full`). Every other
+    // (16384 rows under the compact plan, 4096 under `Full`). Under pipeline
+    // parallelism (`band.is_some()`) the chunk is the one the PP load chose
+    // once (`load_qwen4_pp_bundle`: the requested chunk, stepped down by the
+    // PP auto-fit when the cards cannot hold it) and handed to every band;
+    // bands refuse a chunk that differs from the mesh chunk. Every other
     // arch and any explicit value never probes.
-    let placement_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-        &*ctx.gpu,
-        ctx.max_seq,
-        scratch_mode,
-    );
+    let placement_chunk = if band.is_some() {
+        pp_chunk_rows.ok_or_else(|| {
+            "qwen4: topology.pp band load without the mesh's canonical prefill chunk".to_string()
+        })?
+    } else {
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+            &*ctx.gpu,
+            ctx.max_seq,
+            scratch_mode,
+        )
+    };
     // Freeze the original capacity inputs before placement, materialization or
     // capture growth. Pool readings are separate instants, not a free-memory
     // delta and not evidence of an old model's original preload basis.
@@ -5616,6 +5692,21 @@ fn load_qwen4_rank_scoped(
                 gib(ttm_pool)
             );
         }
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Placement,
+            match &resident_set {
+                Some(resident) => format!(
+                    "experts: {} layers in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
+                    resident.len(),
+                    gib(host_bytes)
+                ),
+                None => format!(
+                    "experts: layers 0..{} in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
+                    vram_layers.min(config.num_hidden_layers),
+                    gib(host_bytes)
+                ),
+            },
+        );
         if let Some(plan) = &whole_first_plan {
             let resident = residency::resident_routed_expert_bytes(&manifest.weights, bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))?;
@@ -5634,7 +5725,21 @@ fn load_qwen4_rank_scoped(
                     &format!("on {}", ctx.gpu.arch),
                 )
             );
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOff,
+                format!(
+                    "MTP off: {moved} expert tensors host-mapped on {} ({})",
+                    ctx.gpu.arch,
+                    hipfire_config::mtp_host_spill_reason()
+                ),
+            );
         }
+    }
+    if placement.is_none() && moe_layers > 0 {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Placement,
+            "experts: fully resident",
+        );
     }
     if whole_first == hotsets::WholeFirstDecision::Active && placement.is_none() {
         if let Some(inputs) = &measured {
@@ -5676,6 +5781,14 @@ fn load_qwen4_rank_scoped(
                     host_bytes,
                     &format!("on {}", ctx.gpu.arch),
                 )
+            );
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOff,
+                format!(
+                    "MTP off: {host_projections} expert tensors host-mapped on {} ({})",
+                    ctx.gpu.arch,
+                    hipfire_config::mtp_host_spill_reason()
+                ),
             );
         }
     }
@@ -6379,16 +6492,24 @@ fn load_qwen4_rank_scoped(
         } else {
             "measured D2 default"
         };
-        // Only a load that asked for `mapped` (or has a mapped layer) says
-        // anything about the cold return; the default copy load is unchanged.
+        // The cold return, readiness and join are reported from the per-layer
+        // effective modes; the request is the arch default on gfx1100 (mapped +
+        // cpwait, explicit env wins), so a load that asked for `mapped` /
+        // `cpwait` (or has such a layer) says so and names the provenance.
+        let transport = hipfire_config::memory::qwen4_d2_transport(&ctx.gpu.arch).ok();
+        let provenance = match transport {
+            Some(t) if t.arch_default => {
+                format!("; transport request: default ({})", ctx.gpu.arch)
+            }
+            _ => String::new(),
+        };
         let return_modes = bundle.split_return_modes();
         let mapped = return_modes
             .iter()
             .filter(|(_, mode)| *mode == "mapped")
             .count();
         let cold_return = if mapped > 0
-            || hipfire_config::memory::qwen4_d2_return()
-                == Ok(hipfire_config::memory::D2Return::Mapped)
+            || transport.is_some_and(|t| t.ret == hipfire_config::memory::D2Return::Mapped)
         {
             format!(
                 "; cold return: {mapped} mapped, {} copy",
@@ -6397,8 +6518,7 @@ fn load_qwen4_rank_scoped(
         } else {
             String::new()
         };
-        // Likewise the readiness and join mechanisms: only a load that asked
-        // for `event` / `cpwait` (or has such a layer) reports them.
+        // Likewise the readiness and join mechanisms.
         let ready_modes = bundle.split_ready_modes();
         let event = ready_modes
             .iter()
@@ -6421,7 +6541,7 @@ fn load_qwen4_rank_scoped(
             .filter(|(_, mode)| *mode == "cpwait")
             .count();
         let join = if cpwait > 0
-            || hipfire_config::memory::qwen4_d2_join() == Ok(hipfire_config::memory::D2Join::CpWait)
+            || transport.is_some_and(|t| t.join == hipfire_config::memory::D2Join::CpWait)
         {
             format!(
                 "; join: {cpwait} cpwait, {} host",
@@ -6431,7 +6551,7 @@ fn load_qwen4_rank_scoped(
             String::new()
         };
         eprintln!(
-            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}): decode and <=4-row verify run their host-placed cold experts on the CPU; wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)",
+            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}{provenance}): decode and <=4-row verify run their host-placed cold experts on the CPU; wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)",
             split_kinds.len(),
             by_kind.join(", ")
         );
@@ -7422,14 +7542,19 @@ fn abort_qwen4_pp_load(
 /// output card and keeps only generation-owned buffers.
 ///
 /// Order: structural mesh re-check, device bring-up (no peer enable), the
-/// per-rank capacity census against each rank's free VRAM (refuses naming
-/// `topology.pp` before any allocation), edge provisioning sized to the
-/// largest canonical chunk's HC streams, then one band-scoped load per rank
+/// one split-and-chunk decision ([`crate::admission::qwen4_pp_auto_fit`]: the
+/// per-rank capacity census against each rank's free VRAM, refusing naming
+/// `topology.pp` before any allocation; it keeps the admitted split at the
+/// requested chunk whenever that fits and otherwise steps the chunk down and
+/// rebalances the bands, never touching an explicit `HIPFIRE_PP_LAYERS` or a
+/// pinned `HIPFIRE_PREFILL_CHUNK_ROWS`), edge provisioning sized to the
+/// chosen canonical chunk's HC streams, then one band-scoped load per rank
 /// (stage 0 on the admitted source, the rest on a fresh source each).
 fn load_qwen4_pp_bundle(
     daemon: &mut rdna_compute::Gpu,
     admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
     placement: &hipfire_runtime::mesh_placement::BandPlacement,
+    explicit_layers: bool,
     shared: &Qwen4RankShared,
     session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
@@ -7468,21 +7593,15 @@ fn load_qwen4_pp_bundle(
             })?;
         free_per_rank.push(free as u64);
     }
-    let (scopes, edge_bytes, chunk_rows) = {
+    let (chosen, scopes, edge_bytes, chunk_rows) = {
         let ModelSource::Hfq(hfq) = &src else {
-            return Err(
-                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-            );
+            return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
         };
         let receipt = q4::admit_hfqm_artifact_on(hfq, Some(&daemon.arch))
             .map_err(|error| error.to_string())?;
         q4::bundle::admit_executable_profile(&receipt.config)
             .map_err(|error| format!("qwen4: {error}"))?;
         let config = receipt.config.clone();
-        let scopes = (0..stages)
-            .map(|stage| q4::weights::Qwen4BandScope::from_placement(&config, placement, stage))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("qwen4: topology.pp: {error}"))?;
         let state_format = q4::resolve_state_format(
             &shared.kv_mode,
             shared.state_quant.as_deref().unwrap_or(""),
@@ -7492,8 +7611,8 @@ fn load_qwen4_pp_bundle(
         let scratch_mode =
             q4::artifact::source_forward_scratch_mode(daemon, hfq, &config, &receipt.manifest)
                 .map_err(|error| error.to_string())?;
-        let chunk_rows =
-            q4::gpu_forward::qwen4_prefill_chunk_requested(daemon, shared.max_seq, scratch_mode);
+        let requested_chunk =
+            q4::gpu_forward::qwen4_pp_prefill_chunk_requested(daemon, shared.max_seq, scratch_mode);
         let context = q4::Qwen4ContextCommit::new(
             shared.backend,
             shared.max_seq,
@@ -7556,37 +7675,79 @@ fn load_qwen4_pp_bundle(
             ),
             batched_fill: q4::mtp_spec::native_mtp_fill_scratch(daemon),
         });
-        let fits =
-            crate::admission::qwen4_pp_band_budget(&crate::admission::Qwen4PpBudgetInputs {
-                config: &config,
-                placement,
-                weights: &receipt.manifest.weights,
-                bytes_of: &bytes_of,
-                format: state_format,
-                context: &context,
-                chunk_rows,
-                mode: scratch_mode,
-                free_per_rank: &free_per_rank,
-                reserve_bytes,
-                native_mtp: native_mtp_inputs,
-            })?;
-        for fit in &fits {
+        // The one split-and-chunk decision of this load
+        // ([`crate::admission::qwen4_pp_auto_fit`]): the admitted split at the
+        // requested chunk whenever it fits (today's load, unchanged), else the
+        // largest chunk some split fits and the most balanced such split. An
+        // explicit `HIPFIRE_PP_LAYERS` is never searched, and a pinned
+        // `HIPFIRE_PREFILL_CHUNK_ROWS` only has its split searched.
+        let admitted_counts: Vec<usize> = (0..stages)
+            .map(|stage| placement.band(stage).len())
+            .collect();
+        let n_layers = placement.n_trunk_layers;
+        let band_placement = |counts: &[usize]| {
+            hipfire_runtime::mesh_placement::BandPlacement::from_counts(
+                &admitted.mesh,
+                n_layers,
+                counts,
+            )
+            .and_then(|bands| {
+                bands.with_first_band_min(crate::admission::QWEN4_PP_FIRST_BAND_MIN_LAYERS)
+            })
+            .map_err(|error| format!("qwen4: topology.pp: {error}"))
+        };
+        let fit = crate::admission::qwen4_pp_auto_fit(
+            &admitted_counts,
+            explicit_layers,
+            crate::admission::QWEN4_PP_FIRST_BAND_MIN_LAYERS,
+            requested_chunk,
+            q4::gpu_forward::qwen4_prefill_chunk_rows_pinned(),
+            |counts, chunk_rows| {
+                let candidate = band_placement(counts)?;
+                crate::admission::qwen4_pp_rank_lines(&crate::admission::Qwen4PpBudgetInputs {
+                    config: &config,
+                    placement: &candidate,
+                    weights: &receipt.manifest.weights,
+                    bytes_of: &bytes_of,
+                    format: state_format,
+                    context: &context,
+                    chunk_rows,
+                    mode: scratch_mode,
+                    free_per_rank: &free_per_rank,
+                    reserve_bytes,
+                    native_mtp: native_mtp_inputs,
+                })
+            },
+        )?;
+        if let Some(line) = fit.log_line() {
+            eprintln!("{line}");
+        }
+        for line in &fit.fits {
             eprintln!(
                 "  qwen4 PP rank {}: layers {:?} need {} MiB of {} MiB free{}",
-                fit.stage,
-                fit.band,
-                fit.required >> 20,
-                fit.free >> 20,
+                line.stage,
+                line.band,
+                line.required >> 20,
+                line.free >> 20,
                 if native_mtp {
-                    format!(" (incl. {} MiB native MTP)", fit.native_mtp >> 20)
+                    format!(" (incl. {} MiB native MTP)", line.native_mtp >> 20)
                 } else {
                     String::new()
                 }
             );
         }
+        // From here the split and the chunk are fixed for every band, the
+        // edge buffers and the mesh.
+        let chunk_rows = fit.chunk_rows;
+        let chosen = band_placement(&fit.counts)?;
+        let scopes = (0..stages)
+            .map(|stage| q4::weights::Qwen4BandScope::from_placement(&config, &chosen, stage))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("qwen4: topology.pp: {error}"))?;
         let edge_bytes = crate::admission::qwen4_pp_edge_max_bytes(&config, chunk_rows)?;
-        (scopes, edge_bytes, chunk_rows)
+        (chosen, scopes, edge_bytes, chunk_rows)
     };
+    let placement = &chosen;
     let mut gpus = init_qwen4_pp_gpus(admitted, placement)?;
     gpus.provision_mesh_edges(admitted, placement, edge_bytes)
         .map_err(|error| format!("qwen4: topology.pp edge provisioning failed: {error}"))?;
@@ -7607,6 +7768,7 @@ fn load_qwen4_pp_bundle(
                 session,
                 source,
                 Some(&scopes[stage]),
+                Some(chunk_rows),
             )
         });
         match loaded {
@@ -7744,8 +7906,17 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         tokenizer: &meta.tokenizer,
         chat_template: meta.chat_template.as_deref(),
     });
-    let (bundle, gpus, native_mtp) =
-        load_qwen4_pp_bundle(ctx.gpu, admitted, placement, &shared, session, src)?;
+    let (bundle, gpus, native_mtp) = load_qwen4_pp_bundle(
+        ctx.gpu,
+        admitted,
+        placement,
+        // `HIPFIRE_PP_LAYERS` (admission's `explicit_counts`): the
+        // operator's split is never searched.
+        ctx.pp_layer_counts.is_some(),
+        &shared,
+        session,
+        src,
+    )?;
     let max_seq = ctx.max_seq;
     let speculator = native_mtp.then(|| {
         // PP mesh: unsupported shape for the measured descriptor; the drafter
@@ -7809,11 +7980,14 @@ fn resolve_qwen_kv_pair(
     )
     .map_err(|e| e.to_string())?;
     match pair {
-        KvPair::Native(k) => eprintln!(
-            "  KV cache: requested mode={mode_raw}, effective KV={} (site {})",
-            kv_mode::qwen_k_display_name(k),
-            policy.site
-        ),
+        KvPair::Native(k) => {
+            let name = kv_mode::qwen_k_display_name(k);
+            eprintln!(
+                "  KV cache: requested mode={mode_raw}, effective KV={name} (site {})",
+                policy.site
+            );
+            hipfire_config::load_summary::note(hipfire_config::load_summary::Facet::Kv, name);
+        }
         KvPair::Split(k, v) => {
             let k_name = kv_mode::qwen_k_display_name(k);
             let v_name = kv_mode::qwen_v_display_name(v);
@@ -7822,6 +7996,10 @@ fn resolve_qwen_kv_pair(
                 policy.site
             );
             eprintln!("  K={k_name} V={v_name}");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Kv,
+                format!("K={k_name} V={v_name}"),
+            );
         }
     }
     Ok(pair)
@@ -8171,6 +8349,7 @@ impl Carrier for Qwen35Carrier {
                             "  vision tower: {}; activation reserve {} MiB for {patches} patches",
                             match residency {
                                 TowerResidency::Resident => "resident",
+                                TowerResidency::HostMapped => "host-mapped",
                                 TowerResidency::Streamed => "streamed",
                             },
                             bytes >> 20
@@ -9635,6 +9814,116 @@ impl Carrier for Lfm2MoeCarrier {
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+                meta.chat_template_source,
+            )
+        })
+    }
+}
+
+// ─── RaonCarrier ─────────────────────────────────────────────────────
+
+pub struct RaonCarrier;
+impl Carrier for RaonCarrier {
+    fn name(&self) -> &'static str {
+        "raon1_mini"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 19
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        // generation_config.json: temperature 1.0, top_p 0.95 (top_k 20 and the
+        // 1.5 presence penalty are applied by the Raon generation route; this
+        // struct carries only temp/top_p/repeat_penalty).
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.raon_mut()?;
+        match bundle.bench_prefill_rows(gpu, synthetic.len()) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                *prefill_err = Some(format!("raon1_mini bench prefill: {e}"));
+                Some(false)
+            }
+        }
+    }
+    /// Prime the decode probe: the same bounded batched prefill `bench_prefill`
+    /// runs (`context` synthetic rows from a cold slot).
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let mut error = None;
+        match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
+            Some(true) => Some(None),
+            Some(false) => {
+                Some(Some(error.unwrap_or_else(|| {
+                    "raon1_mini bench decode prime failed".into()
+                })))
+            }
+            None => None,
+        }
+    }
+    /// `iterations` production decode steps (`RaonBundle::decode_step`, the
+    /// route `serve` runs) on deterministic ids; no logits readback.
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        _context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let Some(bundle) = m.raon_mut() else {
+            *decode_err = Some("raon1_mini bench decode missing state".into());
+            return Some(false);
+        };
+        let vocab = bundle.config.vocab as u64;
+        let lo = 1024u64.min(vocab.saturating_sub(1));
+        let span = vocab - lo;
+        for i in 0..iterations as u64 {
+            let token = (lo + i.wrapping_mul(2654435761).wrapping_add(17) % span) as u32;
+            if let Err(e) = bundle.decode_step(gpu, token) {
+                *decode_err = Some(format!("raon1_mini bench decode step {i}: {e}"));
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_raon::load_raon_bundle(src, ctx)?;
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

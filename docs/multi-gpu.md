@@ -748,7 +748,7 @@ string or a blanket “always refuse at load.”
 | Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests, `HIPFIRE_MTP_SAMPLED=0` and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
@@ -816,6 +816,9 @@ cards and `HIPFIRE_EMULATE_GPUS` aliasing are refused.
   and a sum equal to the trunk's layer count (48 for Flash-Next).
 - Unset (or empty) gives the **uniform** split: `layers / N` per band, the
   remainder going to the first bands (`N = 5` on 48 layers: 10, 10, 10, 9, 9).
+  Flash-Next keeps it whenever every card holds it and otherwise
+  [auto-fits](#per-band-memory-budget) the split and the prefill chunk. A list
+  pins the split: it is never searched.
 - The PLE layer is layer 1, so **band 0 must hold at least 2 layers**; the same
   rule applies to a uniform split and to an explicit list.
 - Example for six 24 GB cards and the mq4-xts model: `9,8,8,8,8,7`, so card 0
@@ -890,14 +893,88 @@ that is short refuses the load, naming every failing rank and its shortfall:
 qwen4: pipeline parallelism (topology.pp = 6): band does not fit device memory: rank 3 (layers 25..33) needs … bytes (… weights + … F16 shadows + … QSA context + … state + … forward scratch + … native MTP + … reserve) but … bytes are free (short by …); rebalance HIPFIRE_PP_LAYERS or lower memory.max_seq (host-mapped band layers are not admitted)
 ```
 
-There is no spill to host-mapped experts: rebalance `HIPFIRE_PP_LAYERS` or lower
-`memory.max_seq`. The canonical prefill chunk is the same on every band; a band
-whose free VRAM cannot hold it refuses instead of shrinking it.
+There is no spill to host-mapped experts. The canonical prefill chunk is the
+same on every band, and a band whose free VRAM cannot hold it at attach
+refuses instead of shrinking it. What changes how a short card is handled is
+the auto-fit below.
+
+##### Auto-fit (`HIPFIRE_PP_LAYERS` and `HIPFIRE_PREFILL_CHUNK_ROWS` unset)
+
+With neither variable set, the load decides the split and the chunk once,
+before any allocation, with the same pure census as the refusal above:
+
+1. **The default wins when it fits.** The uniform split at the default chunk
+   (4096 rows on gfx1201) is taken whenever every card holds it; such a load
+   is unchanged and logs nothing extra.
+2. **Otherwise the chunk steps down.** The rungs are 2048, 1024, 512 and 256
+   rows, only those below the default chunk (and never above `memory.max_seq`).
+   The **largest** chunk at which some split fits wins. At each rung every
+   split with at least 2 layers in band 0 is tried for `pp = 2`; for `pp > 2` a
+   deterministic steepest-descent walk starts at the uniform split and moves
+   one layer at a time between any two bands.
+3. **The most balanced fitting split at that chunk is taken:** the lowest
+   maximum of `required / free` over the cards; a tie goes to the split closest
+   to uniform, then to larger earlier bands.
+4. **One log line** states the move, ahead of the usual per-rank
+   `need … MiB of … MiB free` lines:
+
+   ```text
+   qwen4 PP auto-fit: layers 25,23 chunk 1024 (uniform 24,24 at chunk 4096 short by 1754 MiB on rank 1)
+   ```
+
+5. **If nothing fits** the refusal above is raised for the nearest candidate
+   and ends its text with the search: `auto-fit searched chunk rows … none fits;
+   the nearest, layers … at chunk …, is short by … MiB on rank …`.
+
+**Pin it.** `HIPFIRE_PP_LAYERS=a,b,…` turns the search off entirely: the split
+and the default chunk are used as given and a short card refuses exactly as
+before. `HIPFIRE_PREFILL_CHUNK_ROWS=N` keeps the chunk (it is never stepped
+down) and only the split is searched.
+
+**What it changes in the output.** The chunk changes numerics: output equals a
+single-card run at the same chunk (see [What runs](#what-runs)), so a load the
+auto-fit stepped down to chunk 1024 equals a single card at
+`HIPFIRE_PREFILL_CHUNK_ROWS=1024`, not the 4096 default; pin the same chunk on
+both sides to compare. The split does not: a cut-safe band split is designed
+to equal one uncut card byte for byte and the PP gate checks it (the
+`--ref-ranks` row of the [`fn-ep-gate` options](#qualify-a-box-fn-ep-gate-mode-pp)).
+Both statements are the existing documented claims; this page records no
+measurement of the auto-fit's own output.
+
+**Worked example (arithmetic from measured loads, not a new measurement).**
+Flash-Next `mq3-xts` (59.25 GB) on 2× R9700 with 32,550 MiB free per card at
+`memory.max_seq` 16,384: uniform 24,24 at chunk 4096 needs 35.97 GB on rank 1
+(30.87 weights, 0.62 F16 shadows, 0.16 QSA context, 0.03 state, 1.18 forward
+scratch, 0.93 native MTP, 2.18 reserve), 1.84 GB short; rank 0 fits. No split
+fits at 4096 or 2048 rows; at 1024 rows exactly 25,23 fits (the hand-tuned
+split, rank 0 32,476 MiB, rank 1 32,377 MiB including 755 MiB of MTP). The
+auto-fit therefore picks `25,23` at chunk 1024 with no environment variables.
+A 64K context (`memory.max_seq` 66,048) needed chunk 256 in the measured
+hand-tuned load; the auto-fit walks the same ladder and, from that
+measurement, is expected to land on `25,23` at chunk 256.
 
 #### What runs
 
 - **AR decode** and **pipelined prefill**: a prompt is cut into canonical chunks
   that flow through the bands in order; only the last chunk computes the head.
+  **gfx1201 prefill chunk:** under PP the canonical chunk defaults to **4096
+  rows** (a single card stays at 16384 rows under the compact plan), so a 32K
+  prompt is eight chunks in flight instead of two or three and the band pipeline
+  fills. An explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins (`=16384` restores the
+  previous chunk); the bands and the mesh planner share one chunk, the default
+  chunk when every card holds it and otherwise the one the
+  [auto-fit](#auto-fit-hipfire_pp_layers-and-hipfire_prefill_chunk_rows-unset)
+  chose. Output equals a
+  single-card run at the same chunk. Decode is unchanged (~54 tok/s). Measured
+  2026-10-28, 4x R9700 (PP4), packed mq4-xts, beta c7c44097cc + explicit chunk
+  env, greedy, one fresh process per arm:
+
+  | Prefill tok/s | 16384 rows (old default) | 8192 rows | 4096 rows (new default) |
+  |---|---:|---:|---:|
+  | 8K | 4,838 | 6,039 | 6,709 |
+  | 32K | 6,953 | 14,026 | 16,657 |
+  | 64K | 13,445 | 16,735 | 18,260 |
+  | 131K | 15,194 | 17,444 | 17,885 |
 - **Per-band sessions**: every band attaches its own in-memory session cache
   (`memory.session_cache_bytes`, an independent opportunistic budget per band, see
   [`env-vars.md`](env-vars.md)); only client-committed all-band snapshots are
@@ -908,17 +985,29 @@ whose free VRAM cannot hold it refuses instead of shrinking it.
   reusable under PP. The single-card resident tail/lineage snapshot is not shared
   across bands, so a prompt shorter than 4,096 tokens is always prefilled cold and
   a longer one reuses at most its last 4,096-token boundary.
-- **Greedy native MTP, explicit only**: `speculation.mtp = on` / `--spec mtp`.
+- **Native MTP, explicit only**: `speculation.mtp = on` / `--spec mtp`.
   `auto` and `off` stay AR under PP. The output band drafts, samples and decides;
   every band runs the same verify block `[seed, drafts...]`, partial rejections
   are repaired per band, and the output band finishes the head. Its exactness
   contract is the single-card native-MTP result (tokens, window records, canonical
   state including the MTP head); qualify each hardware cell with `--mtp` in the gate below.
-- **Sampled or penalized requests decode AR** on the mesh, not MTP. MTP sessions
-  are not distributed: a native-MTP request on the mesh never reuses a session
-  snapshot and publishes none. A speculative request that still reaches the mesh
-  with DFlash/DSpark/n-gram/DDTree, a sampled temperature, KV eviction or a
-  checkpoint resume is refused before any state changes.
+- **Sampled native MTP (Leviathan) with neutral penalties** runs on the mesh with
+  the same route as greedy MTP: temperature > 0 requests (the default
+  `speculation.mtp_sampled`, `HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
+  draft from the head's re-scored candidates, verify through the same
+  `[seed, drafts...]` block and accept by speculative rejection sampling, so the
+  emitted stream equals PP AR in distribution (not bit-for-bit; the sampled-MTP
+  chi-square oracle `sampled_mtp_distribution_hw` runs it with
+  `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`). Every draft and target-row read goes
+  through the output band's device. **Penalized sampled requests**
+  (repeat/presence/frequency), `HIPFIRE_MTP_SAMPLED_MODE=naive` (its draws come
+  from the process-wide AR sampler) and `HIPFIRE_MTP_SAMPLED=0`
+  (`speculation.mtp_sampled = false`, the kill switch) decode **AR** on the mesh
+  instead of failing, as do penalized greedy requests. MTP sessions are not
+  distributed: a native-MTP request on the mesh never reuses a session snapshot
+  and publishes none. A speculative request that still reaches the mesh with
+  DFlash/DSpark/n-gram/DDTree, KV eviction or a checkpoint resume is refused
+  before any state changes.
 
 #### Refusals
 
@@ -999,8 +1088,12 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   edge through pinned host memory (no peer access), exactly as the singleton
   PP forward. A decode step is cut into `G` contiguous, balanced, whole-lane
   micro-batches (a lane's rows are never split) that wavefront through the
-  bands with sender completion events gating each receiver upload
-  (`HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
+  bands with sender completion events gating each receiver upload. The
+  gate is a device-side stream wait on the sender's event: the one host
+  thread enqueues every group's launches without blocking on a sender, so the
+  receiver band's kernels are already queued when the edge event fires
+  (`HIPFIRE_PP_LANE_EDGE_HOST_WAIT=1` restores the host `hipEventSynchronize`
+  per edge; `HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
   tiles run as singleton PP tiles. Per-step token staging uses pinned host
   memory with event-fenced asynchronous uploads; it must stay byte-identical
   to a synchronous upload, and no speedup from it is measured or claimed here.
@@ -1178,8 +1271,10 @@ throughput improvement alone does not qualify this route for automatic use.
 
 Dense Qwen3.5/3.6 TP decode reduces each layer's attention and FFN partials
 into the residual through `Gpus::all_reduce_sum_f32_peer_add_routed`
-(`hipfire-runtime`). Every route evaluates the same rank-ordered
-`x + (p0 + p1)`, so the output is the same bytes on each route. With two
+(`hipfire-runtime`). Every route evaluates the same rank-ordered sum, so the
+output is the same bytes on each route: with a 16-bit exchange
+(next section; `auto` picks it for multi-row and TP>=3 reductions) `x + (r(p0) + r(p1))`, with `HIPFIRE_TP_EXCHANGE=f32`
+`x + (p0 + p1)`. With two
 peer-access ranks the default is a symmetric direct-peer read; each reduction
 waits on the peer's producer event and, before the next layer overwrites a
 partial, on the peer's consumer-complete event.
@@ -1204,6 +1299,30 @@ protocol) is on by default; on every other topology both default off:
   the signal tape and the exchange (about 80 KiB for Qwen3.8-27B). Enabling
   this control implies the alternating protocol unless
   `HIPFIRE_TP_PEER_ALTERNATING=0`.
+- `HIPFIRE_TP_PEER_PUSH` (tri-state): inside the whole-token graph each rank
+  pushes its partial into the other ranks' fine-grained VRAM mailboxes as
+  16-byte tagged granules and polls its own mailbox, replacing the host
+  exchange (TP2) or the pack/copy/fold/event route (TP4) with one kernel per
+  rank and no fence. On a gfx1201 pair the f32 variant is bit-identical and
+  drops the in-graph collective chain from 9.2 to 4.3 us, but 27B decode gains
+  only 0.6%, so it is opt-in there. On four gfx1201 ranks it is the default:
+  the bf16 variant is what lets the whole-token graph capture a TP4 decode
+  token (next paragraph).
+
+On four exact gfx1201 ranks on the generic mesh route the whole-token graph is
+also the default (`HIPFIRE_TP_FULL_GRAPH=0` or `HIPFIRE_TP_PEER_PUSH=0` restore
+the eager event route). The bf16 exchange is unchanged (`x + (r(p0) + r(p1) +
+r(p2) + r(p3))`, rank order, fp32 adds), computed by one `tp_peer_pushn`
+kernel per rank per collective: the rank packs its partial to bf16, writes it
+to its slot of every peer's mailbox bank, waits (bounded) for the three other
+slots in its own mailbox, and folds. Two banks alternate with a device-resident
+per-rank generation, so a replayed graph needs no host reset; a rank that saw
+all peers' granules for generation g knows each peer finished g-1. The load
+qualifies the mailboxes with 64 eager exchanges compared bit for bit with a
+host replay. The pushes go to one peer at a time with a fence and barrier between
+destinations (concurrent write-through stores to several peers collapse to
+about 1.5 GB/s per sender). Decode of Qwen3.8-27B mq4-xts on 4x R9700:
+54.0 -> 77.5 tok/s (+43%).
 
 On exact homogeneous gfx1100 and gfx1201 pairs the whole-token graph is the
 default; `HIPFIRE_TP_FULL_GRAPH=0` restores the segmented-graph route with
@@ -1241,6 +1360,82 @@ token. The first decode token after load runs direct and the second captures
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
 `HIPFIRE_TP_FULL_GRAPH=0`.
 
+### Dense TP partial exchange: 16-bit (developer)
+
+The row-parallel stages (attention out-projection, FFN down-projection) leave
+one f32 partial per rank, and the all-reduce moves those partials between
+ranks. The residual stream is f32 and replicated. `HIPFIRE_TP_EXCHANGE`
+selects the format the ranks exchange:
+
+| value | exchange |
+|---|---|
+| unset / `auto` | the default: `bf16` for every multi-row reduction (prefill, speculative verify) at any TP degree and for single-row decode at TP>=3; `f32` for single-row decode at TP2, the one measured loss (bf16 there: -1.4% decode). One pure function, `tp_exchange::auto_exchange(rows, tp)` |
+| `bf16` | forced everywhere: each rank converts its f32 partial to bf16 once (round to nearest even); every rank sums the rounded, rank-ordered partials in f32 into its f32 residual |
+| `f16` | the same with IEEE half (three more mantissa bits, but a partial above 65,504 in magnitude becomes infinity and poisons the residual: overflow is not guarded) |
+| `f32` | forced everywhere: the f32 exchange, rank-ordered f32 sums of the f32 partials, as before |
+
+Only the exchange is 16-bit; the residual stream, the sums and the rooted
+route's broadcast of the finished f32 residual stay f32. Every rank, the
+producer included, adds the rounded value of every partial (`r(p) =
+up(pack(p))`) in the same order, so the replicated residual stays bit-identical
+across ranks and the hand and the generic dense TP routes, which reduce
+through the same `Gpus::all_reduce_sum_f32_peer_add_routed` (hand route, and
+the generic route's TP2) or the executor's `peer_reduce` (generic TP>2), stay
+byte-identical to each other (the `tp_prefill_decode_matches_hand_route`
+hardware test). The result is **not** byte-identical to the f32 exchange: the
+16-bit route is a numeric route, judged by KLD against the f32 exchange and
+the single-card pins, not by byte identity.
+
+The 16-bit route covers every peer-access reduction between distinct devices
+with 2 to 4 ranks and a row count x dim that is a multiple of 8:
+
+- **TP2 direct-peer read**: each rank packs its partial into its own slot of a
+  16-bit buffer (`tp_pack16_*`), records the producer event, waits the peer's,
+  and `tp_fold16_*` adds `r(p0) + r(p1)`, reading the peer's slot through its
+  P2P mapping, into the f32 residual. The alternating-slot protocol keeps one
+  slot per partial buffer.
+- **TP2 whole-token graph**: `tp_graph_signal_reduce16_*_gfx1100` publishes the
+  16-bit copy into the peer's coherent shadow (half the bytes of the f32
+  exchange), then reduces as above. The shadow segments the loader sizes for
+  f32 hold either format.
+- **TP>2**: the rooted fold gathers the peers' 16-bit partials (the root folds
+  its own f32 partial rounded in register), adds the sum to its residual and
+  broadcasts the f32 residual; the generic executor's small-payload all-pull
+  pulls the 16-bit slots and every rank folds them itself.
+
+The host-staged transport, same-device (`HIPFIRE_EMULATE_GPUS`) ranks, rank
+counts above 4, the no-target `AllReduce` and the expert-parallel reductions
+keep the f32 exchange. The dense TP load log reports the choice
+(`[loader] dense qwen TP exchange=bf16 (HIPFIRE_TP_EXCHANGE)`).
+
+Measured 2026-10-27 on hiptrx (R9700, gfx1201), Qwen3.8-27B mq4-xts (sha256
+`3e38ccba…`), `eval_hipfire --scoring-mode prefill --max-chunks 24 --tp N
+--kv-mode q8 --kv-v q8` (the hand dense-TP prefill with per-token hidden
+capture; `HIPFIRE_GRAPH=0`, fresh HOME and kernel cache per run), 24 chunks,
+mean KLD and the paired per-chunk difference against the f32 exchange of the
+same TP degree (95% t interval):
+
+| corpus | TP | f32 | bf16 | bf16 - f32 | f16 | f16 - f32 |
+|---|---|---:|---:|---|---:|---|
+| WT2 | 2 | 0.061277 | 0.059057 | -0.002220 [-0.004432, -0.000007] | 0.059953 | -0.001323 [-0.002996, +0.000350] |
+| code24 | 2 | 0.045400 | 0.045685 | +0.000286 [-0.002197, +0.002768] | 0.043671 | -0.001728 [-0.005858, +0.002401] |
+| WT2 | 4 | 0.059522 | 0.060439 | +0.000917 [-0.000328, +0.002161] | 0.059898 | +0.000375 [-0.001609, +0.002360] |
+| code24 | 4 | 0.042194 | 0.044125 | +0.001931 [-0.002018, +0.005880] | 0.044575 | +0.002381 [-0.001549, +0.006311] |
+
+Both 16-bit formats sit inside the f32 exchange's noise at TP2 and TP4. The
+single-card pins (gfx1201 A4, `--kv-mode fp8 --kv-v q8`: WT2 0.069571, code24
+0.052119) reproduce in the same harness. The TP route's own KLD is lower than
+the single-card pin for every exchange, f32 included (the cause is not
+established here), so the pin comparison does not bound the exchange error:
+the judged quantity is the paired difference above, and none of the 16-bit
+rows is worse than the single-card pin. bf16 is the default because it has the
+f32 range, so no partial can overflow, whereas f16 turns a partial above
+65,504 into infinity. A probe of the f32 partials over the same two TP2 runs
+(6,144 reductions, both ranks, prefill rows) found a largest magnitude of
+436.5 on WT2 and 412.9 on code24 and none above 1,000, so f16 has more than
+100x headroom on these corpora; that is a measurement, not a bound for other
+prompts.
+
 ### Generic mesh executor: TP collectives (developer)
 
 `Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
@@ -1248,7 +1443,9 @@ meshes (PP = EP = 1). TP×PP and any EP axis are refused before any mesh state
 is written. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
 and `AllReduce` collectives over the group of every rank in rank order, with
 the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
-`p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
+`p0 + p1 + …` (with the default 16-bit exchange the `AllReduceAdd` partials are
+the rounded `r(p)` of the previous section; the no-target `AllReduce` stays
+f32), the same bytes on every rank. The transport is chosen once at
 provisioning, and each transport has exactly one route (no per-call choice;
 `peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
 not apply to it):

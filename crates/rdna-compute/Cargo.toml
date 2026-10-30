@@ -17,6 +17,7 @@ flash-attn-ck = ["dep:libloading"]
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
 railgun = { path = "../railgun" }
@@ -391,6 +392,18 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_mq3g256gl_moe_gate_up"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_a8"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4_g11"
 required-features = ["lab"]
 
 [[example]]
@@ -1018,6 +1031,26 @@ name = "pm_loop"
 required-features = ["lab"]
 
 [[example]]
+name = "hip_loop"
+required-features = ["lab"]
+
+[[example]]
+name = "emu_race_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "decode_audit_compile"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_emu_check"
+required-features = ["lab"]
+
+[[example]]
+name = "lift_probe_compile"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_xbatch_oracle"
 required-features = ["lab"]
 
@@ -1066,6 +1099,10 @@ name = "draft_lane_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "head_batch_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
@@ -1096,6 +1133,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "prefill_iu4_producer_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "zba_fold_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -1169,4 +1210,31 @@ required-features = ["lab"]
 # DFlash railgun window GPU oracle (design A); `--features lab`.
 [[example]]
 name = "railgun_copy_fill_oracle"
+required-features = ["lab"]
+
+# Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
+# (two gfx1201 cards); `--features lab`.
+[[example]]
+name = "tp_peer_push_probe"
+required-features = ["lab"]
+
+# TP4 bf16 peer-push collective chain on four gfx1201 cards; `--features lab`.
+[[example]]
+name = "tp_peer_pushn_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_decode_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_flash_check"
 required-features = ["lab"]

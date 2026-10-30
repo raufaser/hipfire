@@ -371,6 +371,12 @@ Registry `desc` carries dated KLD and tok/s figures for these tags; they are reg
 |---|---|---:|---:|---|---|
 | `maple-preview` | `maple-preview.mq2lloydu` | 6.5 | 12 | bf16 | 20B-A1B natively ternary MoE (arch 15); MQ2G256LloydU packs the body value-exactly; optional `q4k` / `bf16` head packs; reasoning model |
 
+### Raon-1-mini-preview (arch 19)
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `raon-1-mini-preview` | `raon-1-mini-preview.mq4-xts` | 17.7 | 20 | KRAFTON Raon-1-mini-preview, 28.8B / 4.3B-active MoE (arch 19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS: experts symmetric MQ4V2 (qt 44) with AWQ + GPTQ refit, attention and `lm_head` Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (thinking on by default), XML `<tool_call>` tools. Registry sampling defaults: temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5, repeat_penalty 1.0 (the model card's coding / math setting is presence_penalty 0; presence applies to generated tokens only). |
+
 ### Image generation (FLUX.1, arch 40)
 
 | Tag | File | Size GB | Min VRAM | Notes |
@@ -682,6 +688,10 @@ hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag
 ```
 
 Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32). Unsupported GGUF quants fail closed in the quantizer.
+
+#### GGUF-native serving (developer tools, gfx1201, default off)
+
+With `HIPFIRE_GGUF_NATIVE=1`, `eval_hipfire`, `bench_qwen35_mq4` and `gguf_native_gen` load a dense Qwen3.5 / 3.6 / 3.8 `.gguf` as it is: the ggml blocks (IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0) are uploaded unchanged, never re-quantised, and the value-head order the exporter changed is undone on the host (row permutations) or carried with the weight (the `out_proj` K axis). Decode runs the `ggml.a8q81` route (activations quantised per 32 to q8_1, integer dot, f32 scale fold); prefill dequantises each weight to F16 and uses the F16 WMMA GEMM. The load log prints the model's bits per weight (summed over every tensor), the route and `kld_class=UNMEASURED` until a KLD run against a pinned teacher exists for the file. A GGUF whose MTP block holds a type outside the admitted set loads trunk-only with the reason named. The product CLI, daemon and `hipfire serve` do not load GGUF yet, and the legacy Q4_K / Q6_K kernels used by the quantizer path are unchanged. Env switches: [env-vars.md](env-vars.md) "GGUF-native".
 
 ---
 
