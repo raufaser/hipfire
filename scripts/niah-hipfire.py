@@ -212,15 +212,22 @@ def main():
                   f"measurement)", flush=True)
             ok_all = False
         bound = None
-        try:
-            with open(log_path) as f:
-                for line in f:
-                    if line.startswith("max_seq:"):
-                        bound = line.split("bound=", 1)[1].split(";",
-                                                                  1)[0]
-                        break
-        except OSError:
-            pass
+        # The daemon prints the max_seq line after the load completes, which
+        # can lag /health (and a slow first load) by minutes; poll rather
+        # than reading once, or a healthy load is misread as unmeasured.
+        for _ in range(24):
+            try:
+                with open(log_path) as f:
+                    for line in f:
+                        if line.startswith("max_seq:"):
+                            bound = line.split("bound=", 1)[1].split(";",
+                                                                     1)[0]
+                            break
+            except OSError:
+                pass
+            if bound is not None:
+                break
+            time.sleep(5)
         print(f"load bound={bound}", flush=True)
         if bound != "legacy-fit":
             print("EXPECTED BOUND legacy-fit", flush=True)
