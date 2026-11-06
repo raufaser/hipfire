@@ -9870,7 +9870,7 @@ impl Gpu {
         let q16_ptr = self
             .scratch
             .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = batch_size.div_ceil(16) as u32;  // P2a Q16: 16 query rows per workgroup
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -9927,7 +9927,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [256, 1, 1],
             32768,
             &mut params,
             || {
@@ -10126,7 +10126,7 @@ impl Gpu {
         let q16_ptr = self
             .scratch
             .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = batch_size.div_ceil(16) as u32;  // P2a Q16: 16 query rows per workgroup
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -10175,7 +10175,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [256, 1, 1],
             32768,
             &mut params,
             || {
