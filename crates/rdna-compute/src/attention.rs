@@ -9850,8 +9850,13 @@ impl Gpu {
         // build compiles the rotation out.
         const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht4_gfx11";
         if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
+            // P2b: warp-specialized fill for the fwht4 K path (helpers
+            // dequantize behind compute); HIPFIRE_FA2_FILL=0 opts out.
+            // R3 stays off here (separate follow-up).
+            let fill = hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
+                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_FILL {}\n{}",
+                u8::from(fill),
                 kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;
@@ -10107,8 +10112,13 @@ impl Gpu {
             || !self.functions.contains_key(PRECONVERT)
             || !self.functions.contains_key(POSTINVERT)
         {
+            // P2b: warp-specialized fill for fwht4 K + lloyd4 V (helpers
+            // dequantize behind compute); HIPFIRE_FA2_FILL=0 opts out.
+            // R3 stays off here (separate follow-up).
+            let fill = hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
+                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_FILL {}\n{}",
+                u8::from(fill),
                 kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;
