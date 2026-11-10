@@ -982,21 +982,34 @@ impl SkewLog {
 }
 
 /// CLOCK_MONOTONIC in ns (the clock rocprofv3 timestamps use).
+// Windows has no clock_gettime: fall back to the system clock. The only
+// caller is the HIPFIRE_EP_SKEW_LOG developer census (off by default), so
+// this never runs in production; it exists so the crate links on MSVC.
 fn monotonic_ns() -> u64 {
-    #[repr(C)]
-    struct Timespec {
-        sec: i64,
-        nsec: i64,
+    #[cfg(windows)]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
-    extern "C" {
-        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    #[cfg(not(windows))]
+    {
+        #[repr(C)]
+        struct Timespec {
+            sec: i64,
+            nsec: i64,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+        }
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: libc `clock_gettime(CLOCK_MONOTONIC = 1, &mut ts)` writes only `ts`.
+        if unsafe { clock_gettime(1, &mut ts) } != 0 {
+            return 0;
+        }
+        ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
     }
-    let mut ts = Timespec { sec: 0, nsec: 0 };
-    // SAFETY: libc `clock_gettime(CLOCK_MONOTONIC = 1, &mut ts)` writes only `ts`.
-    if unsafe { clock_gettime(1, &mut ts) } != 0 {
-        return 0;
-    }
-    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
 }
 
 /// The rank's tail (installed in the row-gather hook).
