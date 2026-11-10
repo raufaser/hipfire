@@ -1414,6 +1414,12 @@ pub struct DeltaNetSnapshot {
     /// against. Save/restore re-fingerprint the passed state and fall back
     /// to memcpy on any mismatch (never copy through stale descriptors).
     bulk_fingerprint: u64,
+    /// Fingerprint of the committed token prefix this snapshot reflects
+    /// ([`dn_prefix_hash_two`] over the forwarded stream `[0..pos]`).
+    /// `0` = the caller did not attest one (DFlash / MTP / VMM-pool legacy
+    /// paths): the cancel path then falls back to a full reset, and the
+    /// resume path skips validation (its pre-hash behavior).
+    pub prefix_hash: u64,
 }
 
 impl DeltaNetSnapshot {
@@ -1615,6 +1621,7 @@ impl DeltaNetSnapshot {
             bulk_rev: None,
             bulk_n_items: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
+            prefix_hash: 0,
         };
         // Arm the bulk route (gfx1100 / gfx1151 / gfx1201): JIT + table upload happen
         // here at setup, never in a decode cycle. Any failure leaves the
@@ -13033,6 +13040,29 @@ pub fn spec_step_ddtree_batched(
     })
 }
 
+/// Fingerprint of the committed token prefix a DeltaNet checkpoint covers.
+///
+/// Two slices so the AR prefill caller can hash `conversation ++ turn suffix`
+/// without allocating; `dn_prefix_hash(tokens) == dn_prefix_hash_two(tokens, &[])`.
+/// SHA-256, first 8 bytes little-endian — byte-identical to
+/// [`hipfire_runtime::checkpoint_pool::prefix_fingerprint`], whose doc records
+/// why this prefix contract deliberately is not FNV-1a (a crafted collision
+/// could otherwise certify the wrong prefix).
+pub fn dn_prefix_hash_two(a: &[u32], b: &[u32]) -> u64 {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for t in a.iter().chain(b.iter()) {
+        h.update(t.to_le_bytes());
+    }
+    let d = h.finalize();
+    u64::from_le_bytes(d[..8].try_into().expect("sha256 >= 8 bytes"))
+}
+
+/// Fingerprint of a single token slice (see [`dn_prefix_hash_two`]).
+pub fn dn_prefix_hash(tokens: &[u32]) -> u64 {
+    dn_prefix_hash_two(tokens, &[])
+}
+
 /// Seed `target_hidden_host` from the prompt by running the target over
 /// each prompt token one at a time with hidden-state extraction enabled.
 /// This is a slow but correct MVP path — the target already ran a fast
@@ -13052,6 +13082,13 @@ pub fn spec_step_ddtree_batched(
 /// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
 /// positional and stays resident, so resume only restores the recurrent state).
 /// Gating (resume enabled / no eviction) is the caller's responsibility.
+///
+/// `prefix` is the committed token stream `[0..pos]` the snapshot reflects,
+/// as two slices (`conversation`, `turn suffix`) so callers never allocate;
+/// it is stored as [`DeltaNetSnapshot::prefix_hash`] and validated before a
+/// resume or a cancel-time restore. `None` (DFlash / MTP / VMM-pool callers)
+/// stores `0` — "not attested".
+#[allow(clippy::too_many_arguments)]
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
@@ -13060,6 +13097,7 @@ pub fn take_dn_checkpoint(
     pos: usize,
     interval: usize,
     cap: usize,
+    prefix: Option<(&[u32], &[u32])>,
 ) {
     if pos == 0 || cap == 0 {
         return;
@@ -13092,6 +13130,10 @@ pub fn take_dn_checkpoint(
         snap.free_gpu(gpu);
         return;
     }
+    // Attest the committed prefix `[0..pos]` this snapshot reflects, so a
+    // later resume / cancel can prove it before restoring non-reversible
+    // recurrent state. `None` stores 0 ("not attested").
+    snap.prefix_hash = prefix.map(|(a, b)| dn_prefix_hash_two(a, b)).unwrap_or(0);
     cks.push((pos, snap));
 }
 
@@ -13521,6 +13563,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                     seq_pos,
                     ckpt_interval,
                     ckpt_cap,
+                    None,
                 );
             }
         }
@@ -13624,6 +13667,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                     pos,
                     ckpt_interval,
                     ckpt_cap,
+                    None,
                 );
             }
         }
@@ -15019,6 +15063,7 @@ mod dn_exchange_tests {
             bulk_rev: Some(buf(REV0, 8)),
             bulk_n_items: 3,
             bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
+            prefix_hash: 0,
         }
     }
 

@@ -479,6 +479,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
                         position,
                         checkpoint_interval,
                         checkpoint_cap,
+                        None,
                     );
                 }
                 Ok(())
