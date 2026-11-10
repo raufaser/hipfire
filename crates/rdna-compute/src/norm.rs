@@ -1412,6 +1412,7 @@ impl Gpu {
         head_dim: usize,
         n_rot: usize,
         freq_base: f32,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // RoPE convention for Qwen3.5 partial rotary: HF
@@ -1487,6 +1488,7 @@ impl Gpu {
             &hd as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
+            yarn as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(entry, grid, [block, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -1498,6 +1500,7 @@ impl Gpu {
             b.push_i32(hd);
             b.push_i32(nr);
             b.push_f32(fb);
+            yarn.push(&mut b);
             b
         });
         if let Some(t) = timer {
@@ -1526,6 +1529,7 @@ impl Gpu {
         freq_base: f32,
         n_heads: usize,
         n_kv_heads: usize,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !matches!((n_heads, n_kv_heads), (16, 2) | (16, 4) | (24, 4)) {
@@ -1593,6 +1597,7 @@ impl Gpu {
             &pp as *const _ as *mut c_void,
             &ep as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
+            yarn as *const _ as *mut c_void,
         ];
         let bytes = (n_heads * 256 * 3 + n_kv_heads * 256 * 2 + (n_heads + n_kv_heads) * 256) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
@@ -1613,6 +1618,7 @@ impl Gpu {
                 b.push_ptr(pp);
                 b.push_f32(ep);
                 b.push_f32(fb);
+                yarn.push(&mut b);
                 b
             },
         );
@@ -1647,6 +1653,7 @@ impl Gpu {
         freq_base: f32,
         n_heads: usize,
         n_kv_heads: usize,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !matches!((n_heads, n_kv_heads), (16, 4)) {
@@ -1693,6 +1700,7 @@ impl Gpu {
             &pp as *const _ as *mut c_void,
             &ep as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
+            yarn as *const _ as *mut c_void,
         ];
         let bytes = (n_heads * 256 * 3 + n_kv_heads * 256 * 2 + (n_heads + n_kv_heads) * 256) * 4
             + crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, 256) * 2;
@@ -1717,6 +1725,7 @@ impl Gpu {
                 b.push_ptr(pp);
                 b.push_f32(ep);
                 b.push_f32(fb);
+                yarn.push(&mut b);
                 b
             },
         );
@@ -1823,6 +1832,7 @@ impl Gpu {
         // Q/K rotate at absolute phase after eviction/compaction; pass 0 when there
         // is no compaction (the common case) — it's a literal no-op offset then.
         pos_offset: i32,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.rope_partial_halfsplit_capture_f32_batched(
             Some(q),
@@ -1836,6 +1846,7 @@ impl Gpu {
             batch_size,
             pos_offset,
             None,
+            yarn,
         )
     }
 
@@ -1866,6 +1877,7 @@ impl Gpu {
         batch_size: usize,
         pos_offset: i32,
         angles: Option<&GpuTensor>,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if q.is_none() && n_heads_q != 0 {
@@ -1917,6 +1929,7 @@ impl Gpu {
                     rows,
                     pos_offset,
                     angle_rows.as_ref(),
+                    yarn,
                 )?;
             }
             return Ok(());
@@ -1969,6 +1982,7 @@ impl Gpu {
         if !legacy {
             params.push(&mut ap as *mut _ as *mut c_void);
         }
+        params.push(yarn as *const _ as *mut c_void);
         let n_pairs = (n_rot / 2) as u32;
         let (grid_x, block, shared_bytes) = if legacy {
             let block = 32u32.min(n_pairs);
@@ -1999,6 +2013,7 @@ impl Gpu {
                 if !legacy {
                     b.push_ptr(ap);
                 }
+                yarn.push(&mut b);
                 b
             },
         );
