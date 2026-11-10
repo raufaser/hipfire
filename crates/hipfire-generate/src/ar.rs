@@ -840,6 +840,99 @@ pub fn ckpt_max() -> usize {
         .max(1)
 }
 
+/// Cancel-with-prefix-preserve for qwen35 (arch 5/6) AR decode aborts.
+///
+/// A client cancel keeps only COMMITTED prefix state — the cancelled
+/// request's prompt, never its partial decode — so the next request reuses
+/// the longest common prefix instead of cold-prefilling (the llama.cpp /
+/// beellama.cpp "release keeps state" shape). `committed_len` is that
+/// prompt length; truncating `conversation_tokens` to the restored
+/// checkpoint is what keeps the next turn's LCP from reaching into the
+/// uncommitted decode region.
+///
+/// Every ineligible case (other arch, eviction / adaptive KV / speculator,
+/// no hash-attested checkpoint at or before `committed_len`, a failed
+/// restore) falls back to [`production_fail_closed_rollback`] — the full
+/// fail-closed reset every abort path took before this existed. The
+/// explicit daemon reset / model-swap path keeps that full reset too.
+/// Prefill-phase aborts never reach here: a partial prefill advanced the
+/// non-reversible DeltaNet with no committed boundary to preserve to.
+///
+/// Guarded by `scripts/test-qwen35-abort-resume.sh`.
+pub fn cancel_preserve_qwen35_prefix(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    committed_len: usize,
+) -> RollbackEpilogue {
+    // Same gates the resume block requires, PLUS the state a checkpoint
+    // restore does not cover: no speculator, no adaptive KV.
+    let arch_ok = m
+        .state
+        .as_ref()
+        .is_some_and(|s| s.as_ref().arch_key() == "qwen35");
+    let evict_safe = m.pp <= 1
+        && m.eviction.is_none()
+        && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0);
+    let eligible = ckpt_resume_enabled()
+        && arch_ok
+        && evict_safe
+        && m.speculator.is_none()
+        && m.kv_adaptive.is_none();
+    // Latest checkpoint at or before the COMMITTED length (never the decode
+    // region) whose prefix hash proves it covers exactly
+    // `conversation_tokens[..pos]`. Decode-region and hash-less snapshots
+    // never qualify — that is the uncommitted-token poison the original
+    // bug resumed off.
+    let idx = if eligible {
+        (0..m.prefill_checkpoints.len()).rev().find(|&i| {
+            let (pos, snap) = &m.prefill_checkpoints[i];
+            *pos <= committed_len
+                && snap.prefix_hash != 0
+                && m.conversation_tokens
+                    .get(..*pos)
+                    .is_some_and(|prefix| snap.prefix_hash == speculative::dn_prefix_hash(prefix))
+        })
+    } else {
+        None
+    };
+    let Some(idx) = idx else {
+        return production_fail_closed_rollback(m, gpu, None, None);
+    };
+    let rpos = m.prefill_checkpoints[idx].0;
+    // Drop every checkpoint past the kept one (decode poison): free each
+    // snapshot's GPU buffers (a bare truncate would leak them).
+    truncate_checkpoints(&mut m.prefill_checkpoints, idx + 1, gpu);
+    // Restore the bundle's DeltaNet state to the kept checkpoint (disjoint
+    // field split, copied from the resume block); any failure -> full reset.
+    let ok = if let (Some(b), Some(ck)) = (
+        m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }),
+        m.prefill_checkpoints.get(idx),
+    ) {
+        ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
+    } else {
+        false
+    };
+    if !ok {
+        return production_fail_closed_rollback(m, gpu, None, None);
+    }
+    m.seq_pos = rpos;
+    // `evict_safe` (above) guarantees compact_offset == 0, so seq_pos already
+    // points the KV write head at rpos; KV past rpos is overwritten by the
+    // next prefill before anything reads it.
+    m.conversation_tokens.truncate(rpos);
+    m.asst_turn_cache.clear();
+    free_checkpoints(&mut m.dflash_checkpoints, gpu);
+    fail_closed_invalidate_graphs_and_replay(gpu);
+    let epilogue = fail_closed_epilogue_after_sync(Ok(()), fail_closed_device_sync(gpu));
+    if epilogue.rolled_back {
+        gpu.replay.begin_replay_observation_window();
+    }
+    eprintln!("[qwen-cache cancel] preserved to checkpoint pos={rpos} (committed={committed_len})");
+    epilogue
+}
+
 /// Truncate a checkpoint ring to `keep` slots, freeing the dropped snapshots'
 /// GPU buffers (a bare `Vec::truncate` would leak them).
 pub fn truncate_checkpoints(
@@ -2275,7 +2368,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
 
     while generated < max_tokens {
         if check_abort(id) {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            // Preserve the committed prompt prefix when the arch can prove it
+            // (qwen35 + hash-attested checkpoint); otherwise the full reset.
+            let ep = cancel_preserve_qwen35_prefix(m, gpu, prompt_tokens.len());
             let _ = gpu.free_tensor(decode_logits);
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
@@ -4566,14 +4661,23 @@ pub fn generate(
             // SAFETY INVARIANT (fix/deltanet-truncation-resume-guard): this
             // restore-checkpoint-at-rpos + replay rendered[rpos..] is exact iff the
             // checkpoint at rpos reflects the committed prefix rendered[..rpos].
-            // That holds because (a) rpos <= lcp => rendered[..rpos] ==
-            // conversation_tokens[..rpos] (lcp is their longest common prefix), and
-            // (b) ALL abort paths now full-reset, so a retained checkpoint can never
-            // carry UNCOMMITTED tokens — the poison that used to drift the
-            // non-reversible DeltaNet state into garbage. If you ever remove an
-            // abort-reset (or let conversation_tokens diverge from the forwarded
-            // stream), this resume becomes unsound: re-validate with a per-checkpoint
-            // prefix hash (llama.cpp's tokens_hash contract) or cold-recompute.
+            // That is now enforced, not assumed:
+            //  (a) every AR checkpoint stores a prefix fingerprint over the
+            //      forwarded tokens [0..pos] it covers, and the resume below
+            //      validates it before restoring (mismatch -> cold reset);
+            //  (b) a decode-phase cancel keeps only checkpoints at or before the
+            //      cancelled request's PROMPT length and rewinds
+            //      DeltaNet/conversation to the latest such one
+            //      (`cancel_preserve_qwen35_prefix`), so a retained checkpoint
+            //      can never carry UNCOMMITTED tokens — the poison that used to
+            //      drift the non-reversible DeltaNet state into garbage;
+            //  (c) prefill-phase aborts and the explicit daemon reset /
+            //      model-swap path still full-reset;
+            //  (d) rpos <= lcp => rendered[..rpos] == conversation_tokens[..rpos]
+            //      (lcp is their longest common prefix), so hashing `rendered`
+            //      below checks exactly what is about to be re-committed to.
+            // If you ever let conversation_tokens diverge from the forwarded
+            // stream without a matching fingerprint, this resume is unsound again.
             // Guarded by scripts/test-qwen35-abort-resume.sh.
             let evict_safe = m.pp <= 1
                 && m.eviction.is_none()
@@ -4610,20 +4714,36 @@ pub fn generate(
             };
             let resumed = if let Some(idx) = resume_idx {
                 let rpos = m.prefill_checkpoints[idx].0;
+                // Prefix-hash contract: a snapshot must PROVE it covers
+                // exactly the committed prefix we are about to re-commit to
+                // before non-reversible DeltaNet state is restored onto it.
+                // `0` = a legacy caller that never attested one; skip
+                // validation for those (their pre-hash behavior).
+                let stored = m.prefill_checkpoints[idx].1.prefix_hash;
+                let hash_ok = stored == 0
+                    || rendered
+                        .get(..rpos)
+                        .is_some_and(|prefix| stored == speculative::dn_prefix_hash(prefix));
+                if !hash_ok {
+                    eprintln!(
+                        "[qwen-cache resume] REJECTED checkpoint pos={rpos}: prefix-hash mismatch — cold reset"
+                    );
+                }
                 // RESTORE only (do NOT zero): roll the bundle's DeltaNet state
                 // back to the checkpoint. Disjoint split: m.state and
                 // m.prefill_checkpoints are different fields of `m`.
-                let ok = if let (Some(b), Some(ck)) = (
-                    m.state.as_mut().and_then(|s| {
-                        (s.as_mut() as &mut dyn Any)
-                            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                    }),
-                    m.prefill_checkpoints.get(idx),
-                ) {
-                    ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
-                } else {
-                    false
-                };
+                let ok = hash_ok
+                    && if let (Some(b), Some(ck)) = (
+                        m.state.as_mut().and_then(|s| {
+                            (s.as_mut() as &mut dyn Any)
+                                .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+                        }),
+                        m.prefill_checkpoints.get(idx),
+                    ) {
+                        ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
+                    } else {
+                        false
+                    };
                 if ok {
                     m.seq_pos = rpos;
                     // `evict_safe` guarantees compact_offset == 0, so setting
@@ -5099,6 +5219,10 @@ pub fn generate(
                 }
             };
             let mut start = 0usize;
+            // Conversation length before this turn's tokens are appended
+            // (the extend is after the loop), so the checkpoint prefix
+            // `conversation ++ forwarded-so-far` covers exactly `[0..seq_pos]`.
+            let base = m.conversation_tokens.len();
             while start < new_tokens.len() {
                 if check_abort(id) {
                     prefill_aborted = true;
@@ -5181,6 +5305,7 @@ pub fn generate(
                 // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
                 // fields, so this composes with the live kv/dn borrows.
                 if ckpt_resume_enabled() {
+                    let done = m.seq_pos.saturating_sub(base).min(new_tokens.len());
                     speculative::take_dn_checkpoint(
                         &mut m.prefill_checkpoints,
                         dn,
@@ -5189,6 +5314,7 @@ pub fn generate(
                         m.seq_pos,
                         ckpt_interval(),
                         ckpt_max(),
+                        Some((&m.conversation_tokens, &new_tokens[..done])),
                     );
                 }
                 start = end;
@@ -5516,12 +5642,12 @@ pub fn generate(
             // Emit aborted+done so the CLI's drain loop terminates
             // cleanly without an extra max_tokens worth of wasted decode.
             if check_abort(id) {
-                // Drop live bundle borrows before production fail-closed rollback.
-                // Tokens so far are uncommitted; DN is non-reversible — full
-                // cold reset via the common attestation path (not a partial
-                // manual clear). Terminal is aborted+done only when attested.
+                // Drop live bundle borrows before the rollback. Tokens past
+                // the prompt are uncommitted and never survive: the cancel
+                // path rewinds DN + conversation to a hash-attested checkpoint
+                // at or before the prompt length, or full-resets (fail closed).
                 let _ = (kv, dn, weights, config, scratch);
-                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                let ep = cancel_preserve_qwen35_prefix(m, gpu, ngram_scope_start);
                 crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
             }
@@ -5715,6 +5841,15 @@ pub fn generate(
             // render diverges within it — without replaying the whole
             // generation. No-op under eviction (compact_offset != 0).
             if ckpt_resume_enabled() {
+                // `conversation_tokens` IS the forwarded stream here; under
+                // eviction `seq_pos` is physical and no resume/cancel path
+                // reads these checkpoints (`evict_safe` gates both).
+                debug_assert!(
+                    m.eviction.is_some() || m.seq_pos == m.conversation_tokens.len(),
+                    "decode checkpoint: seq_pos={} != conversation_tokens.len()={}",
+                    m.seq_pos,
+                    m.conversation_tokens.len()
+                );
                 speculative::take_dn_checkpoint(
                     &mut m.prefill_checkpoints,
                     dn,
@@ -5723,6 +5858,7 @@ pub fn generate(
                     m.seq_pos,
                     ckpt_interval(),
                     ckpt_max(),
+                    Some((&m.conversation_tokens, &[][..])),
                 );
             }
             if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {

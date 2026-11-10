@@ -26,7 +26,9 @@ def tracked():
 def scan(path):
     try:
         data = open(path, "rb").read()
-    except (FileNotFoundError, IsADirectoryError):
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        # PermissionError: Windows raises it for a directory (and for an
+        # unreadable path); either way there are no markers to scan.
         return []
     if b"\0" in data[:8192]:
         return []

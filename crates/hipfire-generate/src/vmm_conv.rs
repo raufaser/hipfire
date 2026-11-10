@@ -145,7 +145,16 @@ pub fn checkpoint(
     pos: usize,
 ) {
     if ckpt_resume_enabled() {
-        speculative::take_dn_checkpoint(checkpoints, dn, kv, gpu, pos, ckpt_interval(), ckpt_max());
+        speculative::take_dn_checkpoint(
+            checkpoints,
+            dn,
+            kv,
+            gpu,
+            pos,
+            ckpt_interval(),
+            ckpt_max(),
+            None,
+        );
     }
 }
 
