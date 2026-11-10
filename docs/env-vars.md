@@ -95,6 +95,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` | ROCm CU affinity masks; **refused on RDNA** | Linux, every process: before ROCr (`Runtime::initialize`) or the HIP runtime (`HipRuntime::load`) loads, hipfire reads the real process environment. A non-blank value is refused with an error when any KFD GPU node is RDNA (gfx10/gfx11/gfx12), or when the topology cannot be read or lists no GPU, because no RDNA device can then be ruled out. It deliberately ignores `ROCR_VISIBLE_DEVICES`. Only all-gfx9 (GCN/CDNA) hosts pass. On 2026-10-14 a CU-masked queue probe hung the R9700 (gfx1201) MES scheduler, forced mode1 resets and took the host down; the mask stays banned until a safe method is approved. The old `200× under ROC_GLOBAL_CU_MASK=0x1` stress recipes are withdrawn. The retained-PM4 queue mask entry points (`AqlQueue::create_with_cu_mask`, `QueueSet::create_with_cu_masks`/`set_cu_mask`) refuse RDNA devices too, and `HIPFIRE_GFX1151_REDLINE_CU_COUNT` accepts only `all`. |
 | `GPU_MAX_HW_QUEUES` | ROCm hardware-queue cap | hipfire never sets it. Read by ROCm before HIP loads, process-wide. With native MTP opted in over a `pcie` host-mapped expert spill on `gfx1200`/`gfx1201`, `GPU_MAX_HW_QUEUES=1` avoids a reported random decode-throughput loss; it is not measured on any other route, so it stays an operator choice. |
 | `HIPFIRE_LOCAL=1` | Skip attaching to running serve | One-shot local daemon. |
+| `HIPFIRE_TIMING` | Serve console per-request timing lines (llama.cpp style) | `1`/`true` prints to the `hipfire serve` stderr, per request: prefill progress per completed chunk (`n_tokens`, progress, elapsed s, tokens/s), the decode rate every 3 s (`n_gen`, `tg`, `tg_3s`), and a final `prompt eval` / `eval` / `total time` summary. Gateway measurement basis (the interval includes admission queueing). Default off; nothing is formatted while unset. |
 | `HIPFIRE_REGISTRY_URL` | Dynamic registry fetch URL | |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry | |
 
@@ -3193,6 +3194,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/cli.rs | developer |
+| `HIPFIRE_TIMING` | crates/hipfire-cli/src/serve/complete.rs | stable |
 | `HIPFIRE_TOKBENCH_ONLY` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
 | `HIPFIRE_TOKBENCH_REPS` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
 | `HIPFIRE_TOKENIZER_DIFF_MIN_LIMIT` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |

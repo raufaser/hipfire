@@ -1327,6 +1327,7 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | Schedule of a spilled step's output rows between the two engines under co-inference (`memory.offload_exec=passback` only): the GPU takes the first rows (the `pcie` arm), the CPU the rest (the `cpu` arm). `auto` (default) schedules it from this host's measured engine rates and refines it online; a number in `(0, 0.5]` pins it; `0` collapses it onto the CPU engine alone, so the mode is byte-identical to `cpu`. Inert (one notice at load) in any other mode. Measure or override with `hipfire offload-bench`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.2. | `auto` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 | `HIPFIRE_SERVE_UI` | Serve the embedded chat UI at `/ui` on the serve listener (same as `hipfire serve --ui`; `--open` also launches the browser). Unauthenticated — warn-level on non-loopback binds. Chat history lives in the browser's IndexedDB; nothing is stored server-side. | OFF |
+| `HIPFIRE_TIMING` | `hipfire serve` console: llama.cpp-style per-request timing lines to stderr — prefill progress per chunk (`n_tokens`, progress, rate), decode rate every 3 s (`n_gen`, `tg`, `tg_3s`), and a final `prompt eval` / `eval` / `total time` summary per request. Gateway measurement basis (includes admission queueing). | OFF |
 
 | `hipfire bench` flag | Purpose |
 |---|---|

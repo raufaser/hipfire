@@ -49,6 +49,7 @@ pub(crate) mod decide;
 pub(crate) mod embeddings;
 pub mod http;
 pub(crate) mod responses;
+pub(crate) mod timing;
 pub(crate) mod ui;
 
 #[derive(Debug)]

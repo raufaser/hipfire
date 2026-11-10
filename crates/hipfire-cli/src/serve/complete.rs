@@ -2468,6 +2468,10 @@ pub(crate) fn complete_request_attempt(
         )
     };
     let (id, created) = identity.clone();
+    // Opt-in llama.cpp-style per-request timing lines on the serve console
+    // (`HIPFIRE_TIMING=1`); each returned line is written to stderr below.
+    let mut timing =
+        crate::serve::timing::TimingPrinter::new(crate::process_truthy("HIPFIRE_TIMING"), &id);
     // - first event must be gen_start with matching request id + attempt_id
     // - contract_version is read only after correlation succeeds
     // - legacy/v2 latched once; second gen_start and pre-start events rejected
@@ -2500,11 +2504,26 @@ pub(crate) fn complete_request_attempt(
     let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
+        // A reasoning token is a generated token (same rule as `first_token_at`).
+        if matches!(event_type, Some("token" | "reasoning")) {
+            if let Some(line) = timing.token() {
+                eprintln!("[hipfire] {line}");
+            }
+        }
+
         // Prefill progress is a display hint, not part of the response
         // contract: it skips the semantic fold and gate (so it can never fail
         // a request or become a delta) and is dropped if it somehow precedes
         // `gen_start`. The stream sink frames it as an SSE comment.
         if event_type == Some("prefill_progress") {
+            if let (Some(d), Some(t)) = (
+                event.get("done").and_then(serde_json::Value::as_u64),
+                event.get("total").and_then(serde_json::Value::as_u64),
+            ) {
+                if let Some(line) = timing.prefill(d, t) {
+                    eprintln!("[hipfire] {line}");
+                }
+            }
             if contract_gate.contract().is_some() {
                 event_callback(event)?;
             }
@@ -2754,6 +2773,9 @@ pub(crate) fn complete_request_attempt(
         }
     }
     let done = gen_result?;
+    for line in timing.finish(&done, first_token_at.get(), attempt_started.elapsed()) {
+        eprintln!("[hipfire] {line}");
+    }
     let mut meta = shared
         .meta
         .lock()
