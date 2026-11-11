@@ -5790,30 +5790,40 @@ impl Gpu {
     }
 
     /// One KKT launch per layer ([`Self::gdn_chunk_kkt_solve_batched`]) instead
-    /// of one per commit segment (gfx1201, default on;
+    /// of one per commit segment (gfx1201 and gfx1100, default on;
     /// `HIPFIRE_GDN_KKT_BATCHED=0` keeps the per-segment launches). The caller
     /// also requires 64-row-aligned segments and more than one of them.
     #[cfg(feature = "deltanet")]
     pub fn gdn_kkt_batched_enabled(&self) -> bool {
-        self.arch == "gfx1201" && hipfire_config::developer_bool("HIPFIRE_GDN_KKT_BATCHED", true)
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1201")
+            && hipfire_config::developer_bool("HIPFIRE_GDN_KKT_BATCHED", true)
     }
 
     /// One chunk-scan launch per layer ([`Self::gdn_chunk_scan_layer_mseg`])
-    /// instead of one per 512-row commit segment (gfx1201 bf16 `out`,
-    /// default on; `HIPFIRE_GDN_SCAN_MSEG=0` keeps the per-segment launches).
-    /// The caller also requires batched KKT A blocks for every row.
+    /// instead of one per 512-row commit segment (gfx1201 bf16 `out` and
+    /// gfx1100 f32 `out`, default on; `HIPFIRE_GDN_SCAN_MSEG=0` keeps the
+    /// per-segment launches). The caller also requires batched KKT A blocks
+    /// for every row.
     #[cfg(feature = "deltanet")]
     pub fn gdn_scan_mseg_enabled(&self, out: GdnScanOut, segment_rows: usize) -> bool {
-        self.arch == "gfx1201"
-            && out == GdnScanOut::Bf16
+        let (arch_ok, emu_guard) = match self.arch.as_str() {
+            "gfx1201" => (
+                out == GdnScanOut::Bf16,
+                hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_err(),
+            ),
+            "gfx1100" => (out == GdnScanOut::F32, true),
+            _ => (false, true),
+        };
+        arch_ok
+            && emu_guard
             && segment_rows == 512
-            && hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_err()
             && hipfire_config::developer_bool("HIPFIRE_GDN_SCAN_MSEG", true)
     }
 
     /// Every 512-row commit segment of one layer's GDN chunk scan in one
-    /// launch (`gdn_chunk_scan_bf16_mseg`): the same segments, in order, as
-    /// successive [`Self::gdn_chunk_scan_segment`] calls with `kkt = false`
+    /// launch (`gdn_chunk_scan_bf16_mseg` on gfx1201,
+    /// `gdn_chunk_scan_gfx1151_mseg` on gfx1100): the same segments, in order,
+    /// as successive [`Self::gdn_chunk_scan_segment`] calls with `kkt = false`
     /// over `a` holding the batched KKT's A for all `n_tokens` rows. Between
     /// segments the state takes the q8/scale/EF round trip in registers, so
     /// `out` and the final state are byte-identical; only the last segment
@@ -5836,10 +5846,23 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
-        const MODULE: &str = "gdn_chunk_scan_bf16_mseg";
+        let (module, source, grid_x, threads) = match self.arch.as_str() {
+            "gfx1201" => (
+                "gdn_chunk_scan_bf16_mseg",
+                kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC,
+                1u32,
+                512u32,
+            ),
+            _ => (
+                "gdn_chunk_scan_gfx1151_mseg",
+                kernels::GDN_CHUNK_SCAN_GFX1151_MSEG_SRC,
+                2u32,
+                256u32,
+            ),
+        };
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.bind_thread()?;
-        self.ensure_kernel(MODULE, kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, MODULE)?;
+        self.ensure_kernel(module, source, module)?;
         // Same frame cadence as one reservation per segment launch.
         for row0 in (0..n_tokens).step_by(512) {
             let _frame = reserve_gdn_requant_frames((n_tokens - row0).min(512) as u32);
@@ -5876,17 +5899,24 @@ impl Gpu {
             &hk as *const _ as *mut c_void,
             &hv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(MODULE, [1, hv, 1], [512, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for p in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
-                b.push_ptr(p);
-            }
-            b.push_i32(r0);
-            b.push_i32(nt);
-            b.push_u32(hk);
-            b.push_u32(hv);
-            b
-        })
+        self.launch_maybe_blob(
+            module,
+            [grid_x, hv, 1],
+            [threads, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
+                    b.push_ptr(p);
+                }
+                b.push_i32(r0);
+                b.push_i32(nt);
+                b.push_u32(hk);
+                b.push_u32(hv);
+                b
+            },
+        )
     }
 
     /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
@@ -5918,11 +5948,18 @@ impl Gpu {
         let (scan_module, scan_source) = self.gdn_chunk_scan_module(out)?;
         self.ensure_kernel(scan_module, scan_source, scan_module)?;
         if self.gdn_kkt_batched_enabled() && self.gdn_scan_mseg_enabled(out, 512) {
-            self.ensure_kernel(
-                "gdn_chunk_scan_bf16_mseg",
-                kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC,
-                "gdn_chunk_scan_bf16_mseg",
-            )?;
+            match self.arch.as_str() {
+                "gfx1201" => self.ensure_kernel(
+                    "gdn_chunk_scan_bf16_mseg",
+                    kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC,
+                    "gdn_chunk_scan_bf16_mseg",
+                ),
+                _ => self.ensure_kernel(
+                    "gdn_chunk_scan_gfx1151_mseg",
+                    kernels::GDN_CHUNK_SCAN_GFX1151_MSEG_SRC,
+                    "gdn_chunk_scan_gfx1151_mseg",
+                ),
+            }?;
         }
         Ok(())
     }
@@ -5972,14 +6009,17 @@ impl Gpu {
     /// `HIPFIRE_GDN_SCAN_OUT_EMU=bf16|f16` (gfx1201, f32 `out` only) is a
     /// quality diagnostic that rounds every `out` value to bf16/f16 RNE while
     /// keeping the f32 store; `emu_bf16` is the byte oracle of the bf16 plane.
-    /// Exact gfx1151 runs its pipelined twin (`gdn_chunk_scan_gfx1151`,
-    /// byte-identical); `HIPFIRE_GFX1151_GDN_SCAN=0` restores `gdn_chunk_scan`.
+    /// Exact gfx1100/gfx1151 run the pipelined twin
+    /// (`gdn_chunk_scan_gfx1151`, byte-identical);
+    /// `HIPFIRE_GFX1151_GDN_SCAN=0` restores `gdn_chunk_scan`.
     #[cfg(feature = "deltanet")]
     fn gdn_chunk_scan_module(&self, out: GdnScanOut) -> HipResult<(&'static str, &'static str)> {
         let emu = hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").ok();
         match (self.arch.as_str(), out, emu.as_deref()) {
             ("gfx1201", GdnScanOut::Bf16, None) => Ok(("gdn_chunk_scan_bf16", kernels::GDN_CHUNK_SCAN_BF16_SRC)),
-            ("gfx1151", GdnScanOut::F32, None) if hipfire_config::developer_bool("HIPFIRE_GFX1151_GDN_SCAN", true) => {
+            ("gfx1100" | "gfx1151", GdnScanOut::F32, None)
+                if hipfire_config::developer_bool("HIPFIRE_GFX1151_GDN_SCAN", true) =>
+            {
                 Ok(("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC))
             }
             (_, GdnScanOut::F32, None) => Ok(("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC)),

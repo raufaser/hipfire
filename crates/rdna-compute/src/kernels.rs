@@ -10114,6 +10114,17 @@ pub const GDN_CHUNK_SCAN_SRC: &str =
 pub const GDN_CHUNK_SCAN_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1151.hip");
 
+/// One launch per layer of [`GDN_CHUNK_SCAN_GFX1151_SRC`] (F32 `out`,
+/// gfx1100, `HIPFIRE_GDN_SCAN_MSEG`): walks every 512-row commit segment in
+/// order, carrying the state between segments through the same q8/scale/EF
+/// round trip in registers; stores the state after the last segment only.
+/// Byte-identical `out` and state.
+pub const GDN_CHUNK_SCAN_GFX1151_MSEG_SRC: &str = concat!(
+    "#define GDN_SCAN_MULTISEG 1\n",
+    "#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan_gfx1151_mseg\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1151.hip")
+);
+
 /// Quality diagnostic twins of [`GDN_CHUNK_SCAN_SRC`] (`HIPFIRE_GDN_SCAN_OUT_EMU`):
 /// every `out` value rounded to bf16 / f16 RNE, still stored as f32.
 #[cfg(feature = "deltanet")]
