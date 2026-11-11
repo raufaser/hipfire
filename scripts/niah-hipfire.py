@@ -233,9 +233,12 @@ def main():
             if bound is not None:
                 break
             time.sleep(5)
+        # With a --max-seq pin the load is operator-sized (bound=user); the
+        # autofit under test only produces bound=legacy-fit when unpinned.
+        expected_bound = "user" if a.max_seq else "legacy-fit"
         print(f"load bound={bound}", flush=True)
-        if bound != "legacy-fit":
-            print("EXPECTED BOUND legacy-fit", flush=True)
+        if bound != expected_bound:
+            print(f"EXPECTED BOUND {expected_bound}", flush=True)
             ok_all = False
         results["resident_bound"] = bound
         if a.budget >= n_ctx:
