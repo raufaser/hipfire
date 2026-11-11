@@ -983,20 +983,32 @@ impl SkewLog {
 
 /// CLOCK_MONOTONIC in ns (the clock rocprofv3 timestamps use).
 fn monotonic_ns() -> u64 {
-    #[repr(C)]
-    struct Timespec {
-        sec: i64,
-        nsec: i64,
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct Timespec {
+            sec: i64,
+            nsec: i64,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+        }
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: libc `clock_gettime(CLOCK_MONOTONIC = 1, &mut ts)` writes only `ts`.
+        if unsafe { clock_gettime(1, &mut ts) } != 0 {
+            return 0;
+        }
+        ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
     }
-    extern "C" {
-        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    // Windows: no POSIX clock_gettime in the MSVC link set. Wall-clock ns since
+    // the UNIX epoch — diagnostic skew-log use only (EP is a Linux feature).
+    #[cfg(not(unix))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
-    let mut ts = Timespec { sec: 0, nsec: 0 };
-    // SAFETY: libc `clock_gettime(CLOCK_MONOTONIC = 1, &mut ts)` writes only `ts`.
-    if unsafe { clock_gettime(1, &mut ts) } != 0 {
-        return 0;
-    }
-    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
 }
 
 /// The rank's tail (installed in the row-gather hook).
