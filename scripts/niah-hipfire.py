@@ -169,7 +169,9 @@ def main():
     ap.add_argument("--port", type=int, default=18081)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--max-tokens", type=int, default=512)
-    ap.add_argument("--timeout", type=int, default=1500)
+    ap.add_argument("--timeout", type=int, default=3600,
+                    help="per-request read timeout; long-context prefills "
+                         "(300K+ tokens) take 25+ min and need headroom")
     ap.add_argument("--startup-timeout", type=int, default=1800)
     ap.add_argument("--out", default="niah-hipfire.json")
     ap.add_argument("--serve-log", default=None)
