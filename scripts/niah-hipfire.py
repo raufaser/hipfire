@@ -14,7 +14,7 @@ Unlike niah-pc.py (llama.cpp) this talks to `hipfire serve`:
 - prefill/decode tok/s come from the response timings object.
 
 Usage:
-    python scripts/niah-hipfire.py --model-path C:/Users/Jan/.hipfire/models/qwen3.8-27b.mq4l \
+    python scripts/niah-hipfire.py --model-path ~/.hipfire/models/qwen3.8-27b.mq4l \
         --expect-n-ctx 152539 --budget 150000 --needle-at 140000 \
         --kv-mode q8 --port 18081 --out niah-q8.json
     python scripts/niah-hipfire.py --model-path ... --expect-n-ctx 262144 \
