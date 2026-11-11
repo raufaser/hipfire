@@ -174,12 +174,17 @@ def main():
     ap.add_argument("--out", default="niah-hipfire.json")
     ap.add_argument("--serve-log", default=None)
     ap.add_argument("--no-stop", action="store_true")
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="pin the load's max_seq (default: omit, so the "
+                         "resident n_ctx is the autofit value under test)")
     a = ap.parse_args()
 
     base = f"http://127.0.0.1:{a.port}"
     log_path = a.serve_log or f"serve-niah-{a.port}.log"
     cmd = ["serve", "--model", a.model_path, f"127.0.0.1:{a.port}",
            "--spec", "off"]
+    if a.max_seq:
+        cmd += ["--max-seq", str(a.max_seq)]
     if a.kv_mode:
         cmd += ["--kv-mode", a.kv_mode]
     if a.kv_k:
