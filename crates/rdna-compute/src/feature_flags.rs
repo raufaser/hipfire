@@ -305,6 +305,16 @@ pub struct FeatureFlags {
     /// launches. Read through [`Self::qwen4_prefill_lwmma_floor_knob`]; scoped to waves only by
     /// `Gpu::qwen4_prefill_lwmma_floor` (singleton chunks, decode and verify never see it).
     pub qwen4_prefill_lwmma_wave_floor: bool,
+    /// `HIPFIRE_QWEN4_WAVE_HEAD_ONE` (default on, `=0` kills; exact gfx1201): the final rows of an
+    /// EP prefill wave of >= 2 lanes take ONE all-rows LM head + argmax under the wide few-row
+    /// scope instead of one one-row GEMV per lane (byte-equal to the singleton, lane oracle).
+    pub qwen4_wave_head_one: bool,
+    /// The prefill lane-WMMA GEMMs above 64 rows of a BF16 weight on the staged-tile kernel
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_TILE`, `lwmma_tile_bf16_*`): every output word is bitwise the
+    /// shipped `lwmma_gemm_bf16_*` kernel's. Default on for exact gfx1201 (`=0` kills it, back to
+    /// the shipped kernel); also gated by the lane WMMA flag. W8 weights and the read-up stay on
+    /// the shipped kernels.
+    pub qwen4_prefill_lwmma_tile: bool,
     /// One multi-part lane-WMMA launch (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) for the dense BF16
     /// projections of one activation at 16..=64 rows (router | selector | shared gate | shared up
     /// of the wide MoE block): up to four parts share one `lwmma_gemm_bf16_t2_m<MT>_n1_multi`
@@ -1358,6 +1368,8 @@ impl FeatureFlags {
             qwen4_prefill_lwmma_hc: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_HC").unwrap_or(true),
             qwen4_prefill_lwmma_wave_floor: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR")
                 .unwrap_or(true),
+            qwen4_wave_head_one: parse_bool("HIPFIRE_QWEN4_WAVE_HEAD_ONE").unwrap_or(true),
+            qwen4_prefill_lwmma_tile: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE").unwrap_or(true),
             qwen4_lwmma_multi_part: parse_bool("HIPFIRE_QWEN4_LWMMA_MULTI_PART").unwrap_or(true),
             qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
             qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
@@ -2137,6 +2149,12 @@ impl FeatureFlags {
         self.qwen4_lane_allrows_exact && self.arch == "gfx1201"
     }
 
+    /// One all-rows LM head for the final rows of an EP prefill wave
+    /// (`HIPFIRE_QWEN4_WAVE_HEAD_ONE`, default on, `=0` kills). Exact gfx1201 only.
+    pub fn qwen4_wave_head_one_enabled(&self) -> bool {
+        self.qwen4_wave_head_one && self.arch == "gfx1201"
+    }
+
     /// The sampled lane rows' D2H lands in pinned host memory
     /// (`HIPFIRE_QWEN4_LANE_PINNED_LOGITS`). Exact gfx1201 only, default on (`=0` restores the
     /// pageable `Vec` path).
@@ -2254,6 +2272,13 @@ impl FeatureFlags {
         } else {
             crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
         }
+    }
+
+    /// Prefill lane-WMMA GEMMs on the staged-tile kernel (`HIPFIRE_QWEN4_PREFILL_LWMMA_TILE`, default
+    /// on, `=0` kills it): bitwise the shipped kernel. Same gate as
+    /// [`Self::qwen4_prefill_lwmma_dense_enabled`].
+    pub fn qwen4_prefill_lwmma_tile_enabled(&self) -> bool {
+        self.qwen4_prefill_lwmma_tile && self.qwen4_lane_wmma_enabled()
     }
 
     /// Multi-part lane-WMMA launches (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`, default on, `=0` kills): needs the
@@ -2498,6 +2523,8 @@ impl FeatureFlags {
             qwen4_prefill_lwmma_dense: false,
             qwen4_prefill_lwmma_hc: false,
             qwen4_prefill_lwmma_wave_floor: false,
+            qwen4_wave_head_one: false,
+            qwen4_prefill_lwmma_tile: false,
             qwen4_lwmma_multi_part: false,
             qwen4_mtp_fc_one_launch: false,
             qwen4_lane_ple_project: false,
@@ -2972,6 +2999,21 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    #[test]
+    fn wave_head_one_defaults_on_exact_gfx1201_and_zero_kills() {
+        let on = |arch: &str, raw: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match raw {
+                Some(v) if name == "HIPFIRE_QWEN4_WAVE_HEAD_ONE" => Ok(v.into()),
+                _ => Err(()),
+            })
+            .qwen4_wave_head_one_enabled()
+        };
+        assert!(on("gfx1201", None));
+        assert!(on("gfx1201", Some("1")));
+        assert!(!on("gfx1201", Some("0")));
+        assert!(!on("gfx1100", None));
     }
 
     #[test]
@@ -4241,6 +4283,64 @@ mod tests {
         let t = FeatureFlags::for_test("gfx1201");
         assert!(!t.qwen4_prefill_lwmma_dense_enabled());
         assert!(!t.qwen4_prefill_lwmma_hc_enabled());
+    }
+
+    /// The prefill lwmma tile knob is default on (`=0` kills it) and reaches exact gfx1201 only;
+    /// `HIPFIRE_QWEN4_LANE_WMMA=0` kills it too and the dense / HC knobs do not.
+    #[test]
+    fn qwen4_prefill_lwmma_tile_flag_default_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: unset"
+            );
+            let off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "0"));
+            assert!(!off.qwen4_prefill_lwmma_tile_enabled(), "{arch}: tile 0");
+            assert_eq!(
+                off.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense kept"
+            );
+            assert_eq!(
+                off.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc kept"
+            );
+            let on = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "1"));
+            assert_eq!(
+                on.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: tile 1"
+            );
+            let dense_off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", "0"));
+            assert_eq!(
+                dense_off.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: dense 0"
+            );
+            let lane_off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_LANE_WMMA", "0"));
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_tile_enabled(),
+                "{arch}: lane 0"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_prefill_lwmma_tile_enabled());
     }
 
     /// The MTP one-launch fc_hidden and lane PLE project flags are default on (`=0` kills) and

@@ -3803,6 +3803,7 @@ fn forward_scratch_layers_multi(
                         gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                     }
                     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                    let yarn = crate::qwen35::config::rope_yarn(config);
                     gpu.rope_partial_interleaved_f32(
                         &s.fa_q,
                         &s.fa_k,
@@ -3812,6 +3813,7 @@ fn forward_scratch_layers_multi(
                         config.head_dim,
                         n_rot,
                         config.rope_theta,
+                        &yarn,
                     )?;
                     if kv_cache.compact_offset > 0 {
                         let phys = pos as i32;
@@ -4510,6 +4512,7 @@ fn forward_scratch_layers_multi(
                         gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                     }
                     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                    let yarn = crate::qwen35::config::rope_yarn(config);
                     gpu.rope_partial_interleaved_f32(
                         &s.fa_q,
                         &s.fa_k,
@@ -4519,6 +4522,7 @@ fn forward_scratch_layers_multi(
                         config.head_dim,
                         n_rot,
                         config.rope_theta,
+                        &yarn,
                     )?;
                     if kv_cache.compact_offset > 0 {
                         let phys = pos as i32;

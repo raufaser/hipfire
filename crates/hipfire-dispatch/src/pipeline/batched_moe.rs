@@ -1955,6 +1955,7 @@ pub fn attention_moe_prep_batched(
             shape: vec![bytes],
             dtype: DType::Raw,
         };
+        let yarn = config.rope_yarn();
         gpu.qwen35_fa_prep_batched_gfx1201(
             pbs.fa_q_full_batch,
             rdna_compute::qwen35_fa_batch::FaPrepQOut::Fp8Codes(&q_codes),
@@ -1969,6 +1970,7 @@ pub fn attention_moe_prep_batched(
             config.n_heads,
             config.n_kv_heads,
             n,
+            &yarn,
         )?;
         return Ok(());
     }
@@ -2004,6 +2006,7 @@ pub fn attention_moe_prep_batched(
         return Ok(());
     }
     let n_rot = config.n_rot;
+    let yarn = config.rope_yarn();
     // pos_offset = compact_offset (absolute RoPE phase post-eviction);
     // pbs.positions stays physical for the KV-write. 0 when no compaction.
     // 39aa358: in DDTree verify, rotate at DEPTH positions instead
@@ -2024,6 +2027,7 @@ pub fn attention_moe_prep_batched(
         config.rope_theta,
         n,
         kv_cache.compact_offset as i32,
+        &yarn,
     )?;
     Ok(())
 }

@@ -1158,6 +1158,11 @@ pub fn batch_chunk_full_attn_prepare(
         && tap.is_none()
         && fa_prep_shape_ok
         && n >= 1;
+    let yarn = rdna_compute::rope::Rope {
+        theta: config.rope_theta as f64,
+        scaling: config.rope_scaling,
+    }
+    .yarn(config.n_rot);
     if gfx12_fa_prep {
         if gfx12_fa_prep_fp8q {
             let bytes = n * config.n_heads * (config.head_dim + 4);
@@ -1182,6 +1187,7 @@ pub fn batch_chunk_full_attn_prepare(
                 config.n_heads,
                 config.n_kv_heads,
                 n,
+                &yarn,
             )?;
         } else {
             gpu.qwen35_fa_prep_batched_gfx1201(
@@ -1198,6 +1204,7 @@ pub fn batch_chunk_full_attn_prepare(
                 config.n_heads,
                 config.n_kv_heads,
                 n,
+                &yarn,
             )?;
         }
     } else if fa_prep_fused_ok {
@@ -1215,6 +1222,7 @@ pub fn batch_chunk_full_attn_prepare(
             config.n_heads,
             config.n_kv_heads,
             n,
+            &yarn,
         )?;
     } else if fa_prep_fused_gfx1151_ok {
         gpu.qwen35_fa_prep_batched_gfx1151(
@@ -1231,6 +1239,7 @@ pub fn batch_chunk_full_attn_prepare(
             config.n_heads,
             config.n_kv_heads,
             n,
+            &yarn,
         )?;
     } else {
         // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
@@ -1318,6 +1327,7 @@ pub fn fa_prep_unfused_rope(
     pos_offset: i32,
 ) -> HipResult<()> {
     let n_rot = config.n_rot;
+    let yarn = config.rope_yarn();
     gpu.rope_partial_interleaved_f32_batched(
         &pbs.fa_q_batch,
         &pbs.fa_k_batch,
@@ -1329,6 +1339,7 @@ pub fn fa_prep_unfused_rope(
         config.rope_theta,
         n,
         pos_offset,
+        &yarn,
     )
 }
 
@@ -1824,6 +1835,7 @@ pub fn batch_chunk_fa_pm_qprep_prep(
     n: usize,
 ) -> HipResult<()> {
     let n_rot = config.n_rot;
+    let yarn = config.rope_yarn();
     let (q16, angles) = fa_pm_qprep_views(config, pbs, n);
     gpu.rmsnorm_batched(
         &pbs.fa_k_batch,
@@ -1845,6 +1857,7 @@ pub fn batch_chunk_fa_pm_qprep_prep(
         n,
         kv_cache.compact_offset as i32,
         Some(&angles),
+        &yarn,
     )?;
     gpu.fa_pm_qprep_exact(
         &pbs.fa_q_full_batch,
