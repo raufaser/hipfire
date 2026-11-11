@@ -9982,8 +9982,13 @@ impl Gpu {
         // build compiles the rotation out.
         const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht4_gfx11";
         if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
+            // P2b: warp-specialized fill for the fwht4 K path (helpers
+            // dequantize behind compute); HIPFIRE_FA2_FILL=0 opts out.
+            // R3 stays off here (separate follow-up).
+            let fill = hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
+                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_FILL {}\n{}",
+                u8::from(fill),
                 kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;
@@ -10002,7 +10007,7 @@ impl Gpu {
         let q16_ptr = self
             .scratch
             .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = batch_size.div_ceil(16) as u32;  // P2a Q16: 16 query rows per workgroup
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -10059,7 +10064,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [256, 1, 1],
             32768,
             &mut params,
             || {
@@ -10239,8 +10244,13 @@ impl Gpu {
             || !self.functions.contains_key(PRECONVERT)
             || !self.functions.contains_key(POSTINVERT)
         {
+            // P2b: warp-specialized fill for fwht4 K + lloyd4 V (helpers
+            // dequantize behind compute); HIPFIRE_FA2_FILL=0 opts out.
+            // R3 stays off here (separate follow-up).
+            let fill = hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
+                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_FILL {}\n{}",
+                u8::from(fill),
                 kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;
@@ -10258,7 +10268,7 @@ impl Gpu {
         let q16_ptr = self
             .scratch
             .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = batch_size.div_ceil(16) as u32;  // P2a Q16: 16 query rows per workgroup
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -10307,7 +10317,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [256, 1, 1],
             32768,
             &mut params,
             || {

@@ -20,6 +20,8 @@
 //   h = 6*kv_h + head_local; q_row = 16*blockIdx.x + q_local.
 // fwht3-K mode retains the incumbent eight-position/128-thread layout;
 // the Q8 geometry change does not alter its launcher or numerical path.
+// fwht4-K joined the 16-position layout in P2a (Q16 cooperative K fill is
+// slot-count agnostic); lloyd-V Q16 lane split rides the same gate.
 //
 // gfx11 wave32 WMMA mapping (measured on gfx1100 with a real probe —
 // lanes r and r+16 supplied identical half16 rows, exact-valued encodings
@@ -90,7 +92,13 @@
 #ifndef HIPFIRE_FA2_Q16
 #define HIPFIRE_FA2_Q16 1
 #endif
-#define FA2_Q16 (HIPFIRE_FA2_Q16 && HIPFIRE_FA2_KMODE == 0)
+// Q16 (256-thread workgroups, 16 query rows = 96 rows/WG) covers KMODE 0
+// and the KMODE=4 pairs ((4,8) Q8 V, (4,4) lloyd4 V): the K fills are
+// WG_THREADS-agnostic, the Q8 V fill has its cooperative form, and the
+// lloyd4 V fill below distributes its 4 sub-blocks over the 4 cooperative
+// lanes. fwht3 (KMODE=3) keeps the 128-thread path for now. P2a: replaces
+// the 128-thread combo path for KMODE=4.
+#define FA2_Q16 (HIPFIRE_FA2_Q16 && (HIPFIRE_FA2_KMODE == 0 || HIPFIRE_FA2_KMODE == 4))
 
 // Key-tile width, selected at JIT time (the host launcher pins the
 // production variant with an explicit define; the file default matches it).
@@ -133,6 +141,9 @@
 #define HIPFIRE_FA2_GFX1100 0
 #endif
 #define FA2_R3 (HIPFIRE_FA2_GFX1100 && FA2_FILL)
+#if FA2_R3 && (HIPFIRE_FA2_KMODE != 0 || HIPFIRE_FA2_VMODE != 8)
+#error "FA2 R3 helper stores are Q8-K/Q8-V only; fwht/lloyd R3 is a follow-up"
+#endif
 
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
@@ -234,6 +245,62 @@ __device__ __forceinline__ void fa2_fill_k_store(uint32_t* Kdw, int idx, uint32_
     }
 }
 
+// fwht4 K, helper-loaded form (FILL path): per (position, kv head) record =
+// [f32 cnorm][128 B nibbles] (132 B/head). Slot (k, b) stages cnorm + the 4
+// packed dwords covering dims b*32..+31 (rec+4+b*16, m*4 stride); the store
+// dequantizes cnorm*TURBO_C4[nibble] into the identical swizzled dword plane
+// the cooperative fill writes (pair p = b*16+m*4+i at K[k][(p + S)&127]).
+// OOB slots stage zeros, matching the Q8 helper's null-row contract.
+// KMODE-gated: the Q8-only module builds never prepend turbo_common.h,
+// so these helpers (and their TURBO_C4 references) must not exist there.
+#if HIPFIRE_FA2_KMODE == 4
+__device__ __forceinline__ void fa2_fill_k_load_fwht4(
+    const unsigned char* k_cache, int ktile, int seq_len, int kv_h, int idx,
+    float& cnorm, uint32_t* packed)
+{
+    const int k = idx >> 3;
+    const int b = idx & 7;
+    const int gk = ktile + k;
+    const unsigned char* rec = (gk < seq_len)
+        ? k_cache + (unsigned long long)gk * 528ULL
+            + (unsigned long long)(unsigned)kv_h * 132ULL
+        : nullptr;
+    float c = 0.0f;
+    if (rec != nullptr)
+        __builtin_memcpy(&c, rec, 4);
+    cnorm = c;
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        uint32_t p = 0;
+        if (rec != nullptr)
+            __builtin_memcpy(&p, rec + 4 + b * 16 + m * 4, 4);
+        packed[m] = p;
+    }
+}
+
+__device__ __forceinline__ void fa2_fill_k_store_fwht4(
+    uint32_t* Kdw, int idx, float cnorm, const uint32_t* packed)
+{
+    const int k = idx >> 3;
+    const int b = idx & 7;
+    const int rot = fa2_swiz(k & 15);
+    const int base = k * 128;
+#pragma unroll 1
+    for (int m = 0; m < 4; ++m) {
+        const uint32_t p0 = (unsigned)b * 16u + (unsigned)m * 4u;
+        const uint32_t byt3 = packed[m];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t byt = (byt3 >> (8 * i)) & 0xFFu;
+            fa2_dw_t dw;
+            dw.h[0] = (_Float16)(cnorm * TURBO_C4[byt & 15u]);
+            dw.h[1] = (_Float16)(cnorm * TURBO_C4[byt >> 4]);
+            Kdw[base + ((p0 + (unsigned)i + (unsigned)rot) & 127u)] = dw.u;
+        }
+    }
+}
+#endif  // HIPFIRE_FA2_KMODE == 4
+
 // V slot = ((m*8+b)<<2) | wq: key pair m, block b, code dwords 2wq, 2wq+1
 // of both keys. Raw = packed scales (s0 | s1<<16), u[0..1] (key 2m),
 // u[2..3] (key 2m+1).
@@ -292,6 +359,74 @@ __device__ __forceinline__ void fa2_fill_v_store(uint32_t* Vdw, int slot, uint32
         }
     }
 }
+
+// lloyd4 V, helper-loaded form (FILL path): per (position, kv head) record =
+// [f32 cnorm][128 B nibbles] (132 B/head, 528 B/pos). Slot (pair, wq) covers
+// key pair (k0, k0+1) x the wq-th 8 dims of block b (m2 = wq); value =
+// cnorm * TURBO_C4_256[nibble]. Dword packs (key0 dim d, key1 dim d),
+// stored at V_T[d][(m + S(d&15)) & V_MASK] — the identical plane the
+// cooperative fill writes. OOB slots stage zeros.
+// VMODE-gated like the K helpers above (Q8-only builds lack turbo_common.h).
+#if HIPFIRE_FA2_VMODE == 4
+__device__ __forceinline__ void fa2_fill_v_load_lloydv4(
+    const unsigned char* v_cache, int ktile, int seq_len, int kv_h, int slot,
+    float& cnorm0, float& cnorm1, uint32_t& u0, uint32_t& u1)
+{
+    const int pair = slot >> 2;
+    const int m2 = slot & 3;
+    const int m = pair >> 3;
+    const int b = pair & 7;
+    const int k0 = ktile + 2 * m;
+    const unsigned char* rec0 = (k0 < seq_len)
+        ? v_cache + (unsigned long long)k0 * 528ULL
+            + (unsigned long long)(unsigned)kv_h * 132ULL
+        : nullptr;
+    const unsigned char* rec1 = (k0 + 1 < seq_len)
+        ? v_cache + (unsigned long long)(k0 + 1) * 528ULL
+            + (unsigned long long)(unsigned)kv_h * 132ULL
+        : nullptr;
+    float c0 = 0.0f, c1 = 0.0f;
+    uint32_t p0 = 0, p1 = 0;
+    if (rec0 != nullptr) {
+        __builtin_memcpy(&c0, rec0, 4);
+        __builtin_memcpy(&p0, rec0 + 4 + b * 16 + m2 * 4, 4);
+    }
+    if (rec1 != nullptr) {
+        __builtin_memcpy(&c1, rec1, 4);
+        __builtin_memcpy(&p1, rec1 + 4 + b * 16 + m2 * 4, 4);
+    }
+    cnorm0 = c0;
+    cnorm1 = c1;
+    u0 = p0;
+    u1 = p1;
+}
+
+__device__ __forceinline__ void fa2_fill_v_store_lloydv4(
+    uint32_t* Vdw, int slot, float cnorm0, float cnorm1, uint32_t u0, uint32_t u1)
+{
+    // File scope has no access to the body's V_ROW/V_MASK constexprs; the
+    // KT define spells the same values (KT32: row 16, mask 15).
+    constexpr int v_row = HIPFIRE_FA2_KT / 2;
+    constexpr int v_mask = HIPFIRE_FA2_KT / 2 - 1;
+    const int pair = slot >> 2;
+    const int m2 = slot & 3;
+    const int m = pair >> 3;
+    const int b = pair & 7;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int d = b * 32 + m2 * 8 + i * 2;
+        const uint32_t by0 = (u0 >> (8 * i)) & 0xFFu;
+        const uint32_t by1 = (u1 >> (8 * i)) & 0xFFu;
+        fa2_dw_t dw;
+        dw.h[0] = (_Float16)(cnorm0 * TURBO_C4_256[by0 & 15u]);
+        dw.h[1] = (_Float16)(cnorm1 * TURBO_C4_256[by1 & 15u]);
+        Vdw[d * v_row + ((m + fa2_swiz(d & 15)) & v_mask)] = dw.u;
+        dw.h[0] = (_Float16)(cnorm0 * TURBO_C4_256[by0 >> 4]);
+        dw.h[1] = (_Float16)(cnorm1 * TURBO_C4_256[by1 >> 4]);
+        Vdw[(d + 1) * v_row + ((m + fa2_swiz((d + 1) & 15)) & v_mask)] = dw.u;
+    }
+}
+#endif  // HIPFIRE_FA2_VMODE == 4
 
 #if FA2_R3
 // Helper slot maps (hl = helper thread 0..63). V slot ((m*8+b)<<2)|wq: the lanes of a
@@ -646,6 +781,22 @@ __device__ __forceinline__ void fa2_gqa_body(
     // tile count and two barriers per tile, so the barriers pair up.
     const bool fill_compute = __builtin_amdgcn_readfirstlane(wave) < 6;
     const int hl = tid - 6 * 32;
+#if HIPFIRE_FA2_VMODE == 4
+    // lloyd4 V helper staging: per slot 2 cnorms + 2 packed dwords (the
+    // wq-th 8 dims of the block); plane layout identical to the Q8 path.
+    float rv_lloyd_c0[FA2_FILL_HV];
+    float rv_lloyd_c1[FA2_FILL_HV];
+    uint32_t rv_lloyd_u0[FA2_FILL_HV];
+    uint32_t rv_lloyd_u1[FA2_FILL_HV];
+    if (!fill_compute) {
+#pragma unroll
+        for (int s = 0; s < FA2_FILL_HV; ++s)
+            fa2_fill_v_load_lloydv4(v_cache, tile0 * KT, seq_len, kv_h,
+                                    hl + s * FA2_FILL_HT,
+                                    rv_lloyd_c0[s], rv_lloyd_c1[s],
+                                    rv_lloyd_u0[s], rv_lloyd_u1[s]);
+    }
+#else
     uint32_t rv_s[FA2_FILL_HV];
     uint32_t rv_u[FA2_FILL_HV * 4];
     if (!fill_compute) {
@@ -658,13 +809,24 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
                             rv_s[s], rv_u + s * 4);
     }
+#endif
     // Tile 0 K: one slot per thread (all eight waves).
+#if HIPFIRE_FA2_KMODE == 4
+    {
+        float tile_kcn;
+        uint32_t tile_kp[4];
+        fa2_fill_k_load_fwht4(k_cache, tile0 * KT, seq_len, kv_h, tid,
+                              tile_kcn, tile_kp);
+        fa2_fill_k_store_fwht4(Kdw, tid, tile_kcn, tile_kp);
+    }
+#else
     {
         uint32_t su;
         uint32_t uc[8];
         fa2_fill_k_load(k_cache, tile0 * KT, seq_len, kv_blk, tid, su, uc);
         fa2_fill_k_store(Kdw, tid, su, uc);
     }
+#endif
     __syncthreads();
     if (fill_compute) {
         for (int tile = tile0; ; ++tile) {
@@ -700,8 +862,13 @@ __device__ __forceinline__ void fa2_gqa_body(
                 }
         }
 #endif
+#if HIPFIRE_FA2_KMODE == 4
+        float rk_fwht4_c[FA2_FILL_HK];
+        uint32_t rk_fwht4_p[FA2_FILL_HK * 4];
+#else
         uint32_t rk_s[FA2_FILL_HK];
         uint32_t rk_u[FA2_FILL_HK * 8];
+#endif
         for (int tile = tile0; ; ++tile) {
             const int ktile = tile * KT;
             if (PARTIAL ? tile >= tile1 : ktile >= seq_len)
@@ -709,6 +876,12 @@ __device__ __forceinline__ void fa2_gqa_body(
             const bool next = PARTIAL ? tile + 1 < tile1 : ktile + KT < seq_len;
             if (next) {
 #pragma unroll
+#if HIPFIRE_FA2_KMODE == 4
+                for (int t = 0; t < FA2_FILL_HK; ++t)
+                    fa2_fill_k_load_fwht4(k_cache, ktile + KT, seq_len, kv_h,
+                                          hl + t * FA2_FILL_HT,
+                                          rk_fwht4_c[t], rk_fwht4_p + t * 4);
+#else
                 for (int t = 0; t < FA2_FILL_HK; ++t)
                     fa2_fill_k_load(k_cache, ktile + KT, seq_len, kv_blk,
 #if FA2_R3
@@ -716,17 +889,32 @@ __device__ __forceinline__ void fa2_gqa_body(
 #else
                                     hl + t * FA2_FILL_HT, rk_s[t], rk_u + t * 8);
 #endif
+#endif
             }
 #pragma unroll
+#if HIPFIRE_FA2_VMODE == 4
+            for (int s = 0; s < FA2_FILL_HV; ++s)
+                fa2_fill_v_store_lloydv4(Vdw, hl + s * FA2_FILL_HT,
+                                         rv_lloyd_c0[s], rv_lloyd_c1[s],
+                                         rv_lloyd_u0[s], rv_lloyd_u1[s]);
+#else
             for (int s = 0; s < FA2_FILL_HV; ++s)
 #if FA2_R3
                 fa2_r3_fill_v_store(Vdw + s * 512, voff, rv_s[s], rv_u + s * 4, (hl >> 4) & 1);
 #else
                 fa2_fill_v_store(Vdw, hl + s * FA2_FILL_HT, rv_s[s], rv_u + s * 4);
 #endif
+#endif
             __syncthreads();  // B1
             if (next) {
 #pragma unroll
+#if HIPFIRE_FA2_VMODE == 4
+                for (int s = 0; s < FA2_FILL_HV; ++s)
+                    fa2_fill_v_load_lloydv4(v_cache, ktile + KT, seq_len, kv_h,
+                                            hl + s * FA2_FILL_HT,
+                                            rv_lloyd_c0[s], rv_lloyd_c1[s],
+                                            rv_lloyd_u0[s], rv_lloyd_u1[s]);
+#else
                 for (int s = 0; s < FA2_FILL_HV; ++s)
                     fa2_fill_v_load(v_cache, ktile + KT, seq_len, kv_blk,
 #if FA2_R3
@@ -734,12 +922,19 @@ __device__ __forceinline__ void fa2_gqa_body(
 #else
                                     hl + s * FA2_FILL_HT, rv_s[s], rv_u + s * 4);
 #endif
+#endif
 #pragma unroll
+#if HIPFIRE_FA2_KMODE == 4
+                for (int t = 0; t < FA2_FILL_HK; ++t)
+                    fa2_fill_k_store_fwht4(Kdw, hl + t * FA2_FILL_HT,
+                                           rk_fwht4_c[t], rk_fwht4_p + t * 4);
+#else
                 for (int t = 0; t < FA2_FILL_HK; ++t)
 #if FA2_R3
                     fa2_fill_k_store(Kdw, fa2_r3_kslot(hl, t), rk_s[t], rk_u + t * 8);
 #else
                     fa2_fill_k_store(Kdw, hl + t * FA2_FILL_HT, rk_s[t], rk_u + t * 8);
+#endif
 #endif
             }
             __syncthreads();  // B2
@@ -988,9 +1183,9 @@ __device__ __forceinline__ void fa2_gqa_body(
             }
         }
 #endif
-        // Q16 uses four cooperative lanes per (key-pair, 32-dim block);
-        // other modes keep the one-lane-per-key-pair V fill.
-        // VMODE 4/3 (lloyd V) imply KMODE != 0, hence non-Q16 here.
+        // Q16 uses four cooperative lanes per (key-pair, 32-dim block)
+        // (slot&3 selects the lane's quarter); other modes keep the
+        // one-lane-per-key-pair V fill.
         for (int t = 0; t < KT_VITERS; ++t) {
             const int slot = tid + t * WG_THREADS;
             const int pair = FA2_Q16 ? slot >> 2 : slot;
@@ -1045,6 +1240,9 @@ __device__ __forceinline__ void fa2_gqa_body(
             // key1 dim d), stored at V_T[d][(m + S(d&15)) & V_MASK].
             // n_kv_heads is 4 in every admitted geometry (entries early-out
             // otherwise), so the row stride is 4*132 = 528 B.
+            // Q16: the 4 cooperative lanes split the m2 sub-blocks (lane wq
+            // owns m2 = wq); coverage and plane layout identical to the
+            // 4-iteration form below.
             const unsigned char* rec0 = (k0 < seq_len)
                 ? v_cache + (unsigned long long)k0 * 528ULL
                     + (unsigned long long)kv_h * 132ULL
@@ -1058,6 +1256,29 @@ __device__ __forceinline__ void fa2_gqa_body(
                 __builtin_memcpy(&cnorm0, rec0, 4);
             if (rec1 != nullptr)
                 __builtin_memcpy(&cnorm1, rec1, 4);
+#if FA2_Q16
+            {
+                const int m2 = slot & 3;
+                uint32_t u0 = 0, u1 = 0;
+                if (rec0 != nullptr)
+                    __builtin_memcpy(&u0, rec0 + 4 + b * 16 + m2 * 4, 4);
+                if (rec1 != nullptr)
+                    __builtin_memcpy(&u1, rec1 + 4 + b * 16 + m2 * 4, 4);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = b * 32 + m2 * 8 + i * 2;
+                    const uint32_t by0 = (u0 >> (8 * i)) & 0xFFu;
+                    const uint32_t by1 = (u1 >> (8 * i)) & 0xFFu;
+                    fa2_dw_t dw;
+                    dw.h[0] = (_Float16)(cnorm0 * TURBO_C4_256[by0 & 15u]);
+                    dw.h[1] = (_Float16)(cnorm1 * TURBO_C4_256[by1 & 15u]);
+                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
+                    dw.h[0] = (_Float16)(cnorm0 * TURBO_C4_256[by0 >> 4]);
+                    dw.h[1] = (_Float16)(cnorm1 * TURBO_C4_256[by1 >> 4]);
+                    Vdw[(d + 1) * V_ROW + ((m + fa2_swiz((d + 1) & 15)) & V_MASK)] = dw.u;
+                }
+            }
+#else
 #pragma unroll 1
             for (int m2 = 0; m2 < 4; ++m2) {
                 uint32_t u0 = 0, u1 = 0;
@@ -1079,6 +1300,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                     Vdw[(d + 1) * V_ROW + ((m + fa2_swiz((d + 1) & 15)) & V_MASK)] = dw.u;
                 }
             }
+#endif
 #elif HIPFIRE_FA2_VMODE == 3
             // lloyd3 V: per (pos, kv head) record = [f32 cnorm][96 B 3-bit
             // codes] (100 B/head — the same contract as fwht3 K). Slot (m, b)
@@ -1891,7 +2113,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
 // Same kernarg list as the fwht3k entry; Q is pre-rotated/pre-converted by
 // attention_fa2_q_preconvert_fwht4_gfx11.
 #if HIPFIRE_FA2_KMODE == 4
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_gfx11(
+extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void attention_q8_0_fa2_gqa_fwht4k_gfx11(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -1908,7 +2130,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
     const int kv_h = blockIdx.y;
     if (kv_h >= 4)
         return;
-    const int q_base = blockIdx.x * 8;
+    const int q_base = blockIdx.x * (HIPFIRE_FA2_Q16 ? 16 : 8);
     if (q_base >= batch_size)
         return;
     fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
@@ -1961,7 +2183,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fa2_o_postinvert_
 // launch by the host, same stream, immediately after). Q pre-rotation is
 // the KMODE=4 helper (V rotation does not touch Q/K).
 #if HIPFIRE_FA2_KMODE == 4 && HIPFIRE_FA2_VMODE == 4
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11(
+extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -1978,7 +2200,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
     const int kv_h = blockIdx.y;
     if (kv_h >= 4)
         return;
-    const int q_base = blockIdx.x * 8;
+    const int q_base = blockIdx.x * (HIPFIRE_FA2_Q16 ? 16 : 8);
     if (q_base >= batch_size)
         return;
     fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
