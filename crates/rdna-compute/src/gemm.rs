@@ -22970,6 +22970,14 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_prequant_i8(a, xq, y, m, k, n, true)
     }
 
+    /// Host mirror of the A8-Lloyd twin's
+    /// `_Static_assert(I8_LDS_BYTES == 36864)` in
+    /// `kernels/src/gemm_mq4g256v2_residual_mmq_i8_lloyd.gfx11.hip`
+    /// (single staged variant: tile128, 1 CTA/WGP). Both Lloyd launchers
+    /// (residual and gate_up) must use this — the kernel's LDS change is a
+    /// one-value edit here, never two hardcoded launch sites.
+    const A8_LLOYD_TWIN_LDS: u32 = 36864;
+
     /// Lloyd A8 twin of `gemm_mq4g256v2_mmq_prequant_i8` (T2, residual only;
     /// T3 adds families): same grid/tiles/producers, LDS pairtab codebook
     /// expansion, signed-B codes, zp' correction. Admission mirrors
@@ -23004,12 +23012,12 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.flush_residual_fold()?;
-        // Single staged variant: tile128, 36864 B LDS = 1 CTA/WGP.
+        // Single staged variant: tile128, A8_LLOYD_TWIN_LDS B LDS = 1 CTA/WGP.
         let (module, source, threads, lds, tile) = (
             "gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_LLOYD_GFX11_SRC,
             512u32,
-            36864u32,
+            Self::A8_LLOYD_TWIN_LDS,
             128usize,
         );
         // NOTE: a single staged module/TU; entry names have no tile suffix.
@@ -23145,12 +23153,12 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.flush_residual_fold()?;
-        // Single staged variant: tile128, 36864 B LDS = 1 CTA/WGP.
+        // Single staged variant: tile128, A8_LLOYD_TWIN_LDS B LDS = 1 CTA/WGP.
         let (module, source, threads, lds, tile) = (
             "gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_LLOYD_GFX11_SRC,
             512u32,
-            36864u32,
+            Self::A8_LLOYD_TWIN_LDS,
             128usize,
         );
         let kernel = "gemm_mq4g256v2_gate_up_silu_mmq_i8_lloyd";
