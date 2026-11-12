@@ -982,9 +982,7 @@ impl SkewLog {
 }
 
 /// CLOCK_MONOTONIC in ns (the clock rocprofv3 timestamps use).
-// Windows has no clock_gettime: fall back to the system clock. The only
-// caller is the HIPFIRE_EP_SKEW_LOG developer census (off by default), so
-// this never runs in production; it exists so the crate links on MSVC.
+#[cfg(target_os = "linux")]
 fn monotonic_ns() -> u64 {
     #[cfg(windows)]
     {
