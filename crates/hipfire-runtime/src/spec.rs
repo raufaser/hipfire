@@ -523,9 +523,9 @@ pub trait SpecTarget {
     ///
     /// Returns `(per-position argmax, captured)`. `captured` is `true` iff all
     /// `block.len()` positions' hidden were written to `hidden_gpu`; a target
-    /// whose batched capture path can't run for this block (e.g. llama with
-    /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
-    /// the caller re-bootstraps the next window. `hidden_gpu` must be
+    /// with no extract layers configured returns `false` and leaves
+    /// `hidden_gpu` untouched, and the caller re-bootstraps the next window.
+    /// `hidden_gpu` must be
     /// `≥ block.len() × dflash_extract_layers().len() × dflash_streams_per_layer() × dim` F32.
     ///
     /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
@@ -550,8 +550,13 @@ pub trait SpecTarget {
     ///
     /// For a point-mass drafter, `accept_greedy_prefix(drafts, picks)` on these
     /// sampled `picks` is exactly distribution-preserving temp-T speculation (the
-    /// committed token is always the target sample). Same contract/`captured`
-    /// semantics as the greedy variant. Returns `Err` by default.
+    /// committed token is always the target sample). Same snapshot contract as
+    /// the greedy variant, but `captured == true` only guarantees rows
+    /// `0..=r` where `r` is the first position whose sample differs from the
+    /// next drafted token (or the last row): a target may stop at that
+    /// rejection (llama's per-token fallback does), leaving later rows
+    /// unwritten. Rows `0..=r` are the seed plus the accepted drafts, the only
+    /// rows a caller may read. Returns `Err` by default.
     #[allow(clippy::too_many_arguments)]
     fn verify_block_sampled_capture_gpu(
         &mut self,
@@ -1100,6 +1105,21 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// `(position, prefix fingerprint)` of every checkpoint in the ring, in the
+    /// same order as [`Self::checkpoint_positions`]. The fingerprint is the
+    /// one stored when the checkpoint was taken (`0` = not attested); the
+    /// resume planner restores only checkpoints whose fingerprint matches the
+    /// conversation prefix they would be restored onto. Default empty: a
+    /// drafter with no attested ring never resumes.
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
+    /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
+    /// `None` when its prompt is not user-terminated. Set before the prompt
+    /// prefill; a speculator with a checkpoint ring snapshots there. Default: ignored.
+    fn set_turn_boundary(&mut self, _boundary: Option<usize>) {}
+
     /// Whether the drafter can continue a target restored or continued live
     /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
     /// session planner prefills cold when it cannot.
@@ -1452,6 +1472,18 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
+    /// `(position, prefix fingerprint)` of the MTP checkpoint ring (see
+    /// [`Speculator::checkpoint_prefix_hashes`]). Default empty.
+    fn mtp_checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
+    /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
+    /// `None` when its prompt is not user-terminated. A drafter with a checkpoint
+    /// ring snapshots its target there during the prompt prefill and keeps that
+    /// snapshot through the following tool-result requests. Default: ignored.
+    fn mtp_set_turn_boundary(&mut self, _boundary: Option<usize>) {}
+
     /// Restore the MTP target's recurrent state to an advertised checkpoint
     /// and discard checkpoints from the now-stale future.
     fn mtp_rewind_to(
@@ -1683,6 +1715,14 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.arch.mtp_checkpoint_positions()
+    }
+
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.arch.mtp_checkpoint_prefix_hashes()
+    }
+
+    fn set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.arch.mtp_set_turn_boundary(boundary);
     }
 
     fn rewind_to(

@@ -20,7 +20,7 @@ use crate::speculative::{
     seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
     spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun, xorshift_next_unit, DdtreeScratch,
     DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, VerifyScratch,
+    HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, TurnCheckpoint, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -2320,6 +2320,12 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// This request's user-turn boundary (`Speculator::set_turn_boundary`), taken by
+    /// the prompt seed.
+    turn_boundary: Option<usize>,
+    /// Position of the newest user-turn snapshot in `checkpoints`, protected from
+    /// recycling until the next user turn replaces it.
+    pinned_boundary: Option<usize>,
     last_window: Option<DflashWindowMark>,
     /// Adaptive verify-block controller (trailing-τ proposal shrink),
     /// owned by `hipfire_runtime::dflash_adaptive_block` so the policy is
@@ -2383,6 +2389,8 @@ impl DflashSpeculator {
             sample_top_k: hipfire_runtime::llama::ar_candidate_cap(None),
             sample_cactus: 0.0,
             checkpoints: Vec::new(),
+            turn_boundary: None,
+            pinned_boundary: None,
             resume_enabled,
             ck_interval,
             ck_cap,
@@ -2513,6 +2521,14 @@ impl Speculator for DflashSpeculator {
         // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
         // seed the full prompt (the seed fn resets target state itself).
         let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
+        // This request's user-turn boundary: the seed snapshots at its newest
+        // chunk end at or before it; that snapshot stays pinned through the
+        // following tool-result requests until the next user turn. One-shot per
+        // request.
+        let mut turn = TurnCheckpoint {
+            boundary: self.turn_boundary.take().filter(|_| self.resume_enabled),
+            pin: self.pinned_boundary,
+        };
         let ckpt_sink = if self.resume_enabled {
             Some(&mut self.checkpoints)
         } else {
@@ -2525,10 +2541,12 @@ impl Speculator for DflashSpeculator {
                 &mut df.hidden_rb,
                 prefill_tokens,
                 prefill_start,
+                prompt_tokens.get(..prefill_start).unwrap_or(&[]),
                 abort,
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                &mut turn,
             )
         } else {
             seed_target_hidden_from_prompt_abortable(
@@ -2541,12 +2559,14 @@ impl Speculator for DflashSpeculator {
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                &mut turn,
             )
         }
         .map_err(|e| {
             hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
             e.to_string()
         })?;
+        self.pinned_boundary = turn.pin;
         if aborted {
             // Caller resets conversation state + emits aborted/done; the slot
             // guard restores the target bundle on the way out.
@@ -2639,10 +2659,12 @@ impl Speculator for DflashSpeculator {
             &mut df.hidden_rb,
             tokens,
             start_pos,
+            &[],
             abort,
             None,
             self.ck_interval,
             self.ck_cap,
+            &mut TurnCheckpoint::default(),
         )
         .map_err(|e| e.to_string())?;
         if aborted {
@@ -3238,8 +3260,19 @@ impl Speculator for DflashSpeculator {
         }
     }
 
+    fn set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.turn_boundary = boundary;
+    }
+
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.checkpoints.iter().map(|(p, _)| *p).collect()
+    }
+
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.checkpoints
+            .iter()
+            .map(|(p, snap)| (*p, snap.prefix_hash))
+            .collect()
     }
 
     fn rewind_to(
@@ -3838,6 +3871,7 @@ pub fn dflash_prefill_lane_parts(
         ckpt_sink,
         policy.interval,
         policy.cap,
+        &mut TurnCheckpoint::default(),
     )
     .map_err(|e| {
         hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
@@ -3900,10 +3934,12 @@ pub fn dflash_repair_terminal_prefix_parts(
         &mut df.hidden_rb,
         &replay,
         position,
+        &[],
         &|| false,
         policy.resume_enabled.then_some(checkpoints),
         policy.interval,
         policy.cap,
+        &mut TurnCheckpoint::default(),
     )
     .map_err(|e| e.to_string())?;
     debug_assert!(!aborted, "terminal repair uses a non-aborting callback");

@@ -194,6 +194,12 @@ pub struct FeatureFlags {
     /// selects the named ones, `0` none. Exact gfx1201 only (see
     /// [`FeatureFlags::qwen4_moe_glue_fold_enabled`]).
     pub qwen4_moe_glue_fold: u8,
+    /// gfx942 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`, default on, the Route-A twin
+    /// is sealed; `=0` kills): the sealed qt=55 grouped route's seven glue launches
+    /// (stable-scatter ranks / prefix / scatter + tile descriptors; routed unscatter-SiLU, shared
+    /// activation, shared scaled add) run as two folded launches plus a combine that carries the
+    /// shared add. Exact gfx942 only (see [`FeatureFlags::qwen4_g942_fold_moe_enabled`]).
+    pub qwen4_g942_fold_moe: bool,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
     /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
@@ -615,9 +621,10 @@ pub struct FeatureFlags {
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 and
     /// HFQ4G256/MQ4G256 v1 WMMA GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per
     /// block, X slab staged in LDS) for gate_up/qkvza/qkv/residual (residual also
-    /// carries the 4-bit batched lm_head), and the matching Q8_0
-    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head). Default on for exact gfx1151, false
-    /// elsewhere; outputs are byte-identical to the base kernels.
+    /// carries the 4-bit batched lm_head), the matching Q8_0
+    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head, Q8 gate_up) and the F16
+    /// `gemm_f16_wmma_gfx1151_xlds` (DSpark drafter lm_head). Default on for exact
+    /// gfx1151, false elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
@@ -1339,6 +1346,7 @@ impl FeatureFlags {
             qwen4_moe_glue_fold: parse_moe_glue_fold(
                 value("HIPFIRE_QWEN4_MOE_GLUE_FOLD").ok().as_deref(),
             ),
+            qwen4_g942_fold_moe: parse_bool("HIPFIRE_QWEN4_G942_FOLD_MOE").unwrap_or(true),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
@@ -1349,7 +1357,15 @@ impl FeatureFlags {
             qwen4_lane_allrows_moe: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_MOE").unwrap_or(true),
             qwen4_lane_allrows_exact: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_EXACT").unwrap_or(false),
             qwen4_lane_pinned_logits: parse_bool("HIPFIRE_QWEN4_LANE_PINNED_LOGITS").unwrap_or(true),
-            qwen4_lane_device_sample: parse_bool("HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE").unwrap_or(true),
+            // `serve.batch_exact = seeded` (env `HIPFIRE_QWEN4_LANE_ROW_EXACT`) keeps the host
+            // row-read sampler: the lane-wide device draw was measured composition dependent
+            // for seeded lanes (D1 identity check: 2-3/8 seeded C8 replies equal to C1 with it,
+            // 6-7/8 without).
+            qwen4_lane_device_sample: parse_bool("HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE")
+                .unwrap_or(true)
+                && hipfire_config::parse_lane_row_exact(
+                    value(hipfire_config::QWEN4_LANE_ROW_EXACT_ENV).ok().as_deref(),
+                ) != hipfire_config::LaneRowExact::GreedySeeded,
             qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
@@ -2163,7 +2179,8 @@ impl FeatureFlags {
     }
 
     /// Qwen4 EP lanes draw T>0 tokens on the device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`).
-    /// Exact gfx1201 only, default on (`=0` restores the host row-read sampler exactly).
+    /// Exact gfx1201 only, default on (`=0` restores the host row-read sampler exactly); off
+    /// under `serve.batch_exact = seeded`.
     pub fn qwen4_lane_device_sample_enabled(&self) -> bool {
         self.qwen4_lane_device_sample && self.arch == "gfx1201"
     }
@@ -2206,6 +2223,12 @@ impl FeatureFlags {
     /// default off.
     pub fn qwen4_moe_glue_fold_enabled(&self, bit: u8) -> bool {
         self.qwen4_moe_glue_fold & bit != 0 && self.arch == "gfx1201"
+    }
+
+    /// gfx942 stock-FP8 MoE glue folds (`HIPFIRE_QWEN4_G942_FOLD_MOE`): exact gfx942 only,
+    /// default on (`=0` kills).
+    pub fn qwen4_g942_fold_moe_enabled(&self) -> bool {
+        self.qwen4_g942_fold_moe && self.arch == "gfx942"
     }
 
     pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
@@ -2500,6 +2523,7 @@ impl FeatureFlags {
             qwen4_router_fast: false,
             qwen4_moe_scatter_scan: false,
             qwen4_moe_glue_fold: 0,
+            qwen4_g942_fold_moe: false,
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,
@@ -3962,6 +3986,27 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_device_sample_enabled());
+    }
+
+    /// `serve.batch_exact = seeded` keeps the host lane sampler; `off` / `greedy` do not.
+    #[test]
+    fn qwen4_lane_device_sample_is_off_under_batch_exact_seeded() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == hipfire_config::QWEN4_LANE_ROW_EXACT_ENV {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for (mode, device) in [("off", true), ("greedy", true), ("seeded", false)] {
+            assert_eq!(
+                FeatureFlags::from_lookup("gfx1201", with(mode)).qwen4_lane_device_sample_enabled(),
+                device,
+                "{mode}"
+            );
+        }
     }
 
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.

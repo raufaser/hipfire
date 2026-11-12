@@ -1259,8 +1259,20 @@ pub struct LoadedModel {
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    /// Position of the newest user-turn boundary snapshot in `prefill_checkpoints`
+    /// (`prompt_frame::user_turn_resume_boundary`): the AR ring recycles every other
+    /// entry before it, so the follow-up user turn's re-render finds it after a long
+    /// tool chain. Position-keyed and only ever protects the entry at that position,
+    /// so a stale value left by a reset is harmless.
+    pub user_turn_ckpt: Option<usize>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
+    /// Content fingerprints (sha256 of the image bytes, in order) of the images
+    /// resident in `conversation_tokens`. Every image's rows carry the same
+    /// `<|image_pad|>` id, so token equality alone cannot tell a replaced
+    /// same-size image from the resident one; a vision turn reuses the resident
+    /// conversation only when these match the prompt's images.
+    pub vl_image_fingerprints: Vec<[u8; 32]>,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
@@ -1324,7 +1336,9 @@ impl LoadedModel {
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
+            vl_image_fingerprints: Vec::new(),
             prefill_checkpoints: Vec::new(),
+            user_turn_ckpt: None,
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path,
@@ -3279,9 +3293,13 @@ fn finish_qwen35_load(
                         },
                     );
                     // Further DeltaNet checkpoints yield to the admitted context.
+                    // The prefill scratch is already resident whenever a prefill takes a
+                    // checkpoint, and the checkpoint term is the ring's own two-snapshot
+                    // budget (the gate charges each extra snapshot separately), so neither
+                    // is charged again here.
                     ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {
                         admitted_tokens: ctx.max_seq.min(physical_cap),
-                        reserve_bytes: m.transient,
+                        reserve_bytes: m.transient.saturating_sub(m.prefill + m.checkpoints),
                     });
                 }
             }
@@ -3449,6 +3467,7 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
+    let vmm_runtime_refusal = gpu.vmm_runtime_refusal();
     let admission = crate::admission::admit_source_with_options(
         path,
         1, // this entry serves tp<=1
@@ -3473,7 +3492,7 @@ pub fn load_model_with_gemma4_drafter(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         crate::admission::SourceAdmissionOptions {
@@ -5031,7 +5050,8 @@ pub fn load_model_ep_with_kv_mode(
             kv_adaptive: None,
             cask: None,
             deepseek4_heterogeneous: false,
-            vmm_runtime_available,
+            vmm_runtime_refusal: (!vmm_runtime_available)
+                .then_some("the HIP runtime has no VMM allocation granularity on every rank"),
             free_vram_bytes: None, // EP has no single-card KV capacity envelope.
         },
     )?;

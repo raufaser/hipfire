@@ -1012,6 +1012,15 @@ fn monotonic_ns() -> u64 {
     }
 }
 
+/// No CLOCK_MONOTONIC (and no rocprofv3) off Linux; the libc constant differs per OS, so a
+/// process-local monotonic clock keeps the log lines ordered instead.
+#[cfg(not(target_os = "linux"))]
+fn monotonic_ns() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_nanos() as u64
+}
+
 /// The rank's tail (installed in the row-gather hook).
 pub(crate) struct UnitTailRank {
     inner: Mutex<Inner>,

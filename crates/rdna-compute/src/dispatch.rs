@@ -1804,6 +1804,10 @@ pub struct Gpu {
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
+    /// Verdict of the one-time virtual-address reservation probe
+    /// ([`Self::vmm_runtime_refusal`]): `None` = the runtime reserved a range,
+    /// `Some(reason)` = it could not. Decided once per device owner.
+    vmm_runtime_probe: std::sync::OnceLock<Option<String>>,
     /// `hipHostMalloc(hipHostMallocMapped)` owners, keyed by the **device-visible**
     /// base address kernels are handed. The value is the *host* pointer that
     /// `hipHostFree` needs, which `hipHostGetDevicePointer` may alias differently
@@ -2096,7 +2100,8 @@ pub const STEADY_READBACK_PINNED_ENV: &str = "HIPFIRE_STEADY_READBACK_PINNED";
 pub struct KvFitFloor {
     /// The published (admitted) context in tokens.
     pub admitted_tokens: usize,
-    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    /// What a request still allocates after its prefill scratch is resident (the fit's MTP
+    /// scratch; the prefill scratch and the charged checkpoints are not counted again).
     pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
@@ -3244,6 +3249,7 @@ impl Gpu {
             vmm_generations: HashMap::new(),
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
+            vmm_runtime_probe: std::sync::OnceLock::new(),
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
@@ -6060,8 +6066,11 @@ impl Gpu {
     /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
     /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
     /// gfx11 IU4 MMQ base entry handles partial 128-row tiles.
+    /// An A8-owned shape never takes the sidecar (as on gfx1201): a fused A8
+    /// producer owns it, else the consumer's standalone A8 quantizer does.
     pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
         self.flags.iu4_producer_sidecar_enabled()
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && batch >= 64
@@ -6194,6 +6203,7 @@ impl Gpu {
     pub fn iu4_gfx11_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx11_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && batch >= 64
@@ -7120,7 +7130,14 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        let mut arena =
+            VmmArena::reserve(&self.hip, self.device_id, byte_size).map_err(|mut err| {
+                err.message.push_str(
+                "; this runtime could not reserve the virtual address range a VMM tensor needs \
+                 (a KV cache can use --kv-backend legacy / memory.kv_backend = legacy instead)",
+            );
+                err
+            })?;
         if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
@@ -8684,6 +8701,31 @@ impl Gpu {
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
     }
 
+    /// Why this runtime cannot back a VMM KV cache, or `None` when it can.
+    ///
+    /// [`Self::vmm_recommended_granularity`] only queries a driver constant and
+    /// passes on stacks whose `hipMemAddressReserve` then returns
+    /// `hipErrorOutOfMemory` (#1058: gfx1100, in-tree amdgpu 6.8 under ROCm
+    /// 10.0), which made an automatically selected VMM backend fail the load
+    /// after every weight was uploaded. This runs the real reservation once
+    /// (see [`hip_bridge::probe_va_reservation`]); admission turns a refusal into
+    /// the legacy backend with the reason attached. The verdict is cached for the
+    /// life of this `Gpu`.
+    pub fn vmm_runtime_refusal(&self) -> Option<String> {
+        self.vmm_runtime_probe
+            .get_or_init(|| {
+                if let Err(err) = self.vmm_recommended_granularity() {
+                    return Some(format!("hipMemGetAllocationGranularity failed: {err}"));
+                }
+                hip_bridge::probe_va_reservation(&self.hip, self.device_id)
+                    .err()
+                    .map(|err| {
+                        format!("a probe reservation of virtual address space failed: {err}")
+                    })
+            })
+            .clone()
+    }
+
     pub fn vmm_allocation_count(&self) -> usize {
         // bind_thread: skip — pure length read, touches no device state.
         self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
@@ -9864,6 +9906,23 @@ impl Gpu {
     pub fn pool_parked_bytes(&self) -> usize {
         // bind_thread: skip — pure read of the pool's host-side byte counter, no HIP call.
         self.pool.pooled_bytes()
+    }
+
+    /// Test seam (the daemon's `serve-fault-inject` build): the pool allocation
+    /// after `after_allocs` further ones is forced to miss the free lists and fail
+    /// as an injected `hipErrorOutOfMemory`, so the production out-of-memory retry
+    /// (drain every pooled buffer, allocate again once) runs at a chosen moment.
+    /// `None` disarms. Inert unless a test arms it.
+    pub fn inject_pool_oom(&mut self, after_allocs: Option<u32>) {
+        // bind_thread: skip — arms a host-side counter, no HIP call.
+        self.pool.inject_oom(after_allocs);
+    }
+
+    /// `(drains, injected_oom)`: times a drain returned pooled buffers to HIP, and
+    /// injected out-of-memory failures consumed ([`Self::inject_pool_oom`]).
+    pub fn pool_drain_counters(&self) -> (u64, u64) {
+        // bind_thread: skip — pure read of host-side counters, no HIP call.
+        (self.pool.drains, self.pool.injected_oom)
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.

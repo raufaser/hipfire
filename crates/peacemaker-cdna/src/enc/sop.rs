@@ -303,14 +303,14 @@ pub fn waitcnt_imm(arch: Arch, vm: u8, exp: u8, lgkm: u8) -> Result<u16> {
     }
     let (vm, exp, lgkm) = (u16::from(vm), u16::from(exp), u16::from(lgkm));
     Ok(match arch {
-        Arch::Gfx942 => (vm & 0xf) | (vm >> 4) << 14 | exp << 4 | lgkm << 8,
+        Arch::Gfx942 | Arch::Gfx950 => (vm & 0xf) | (vm >> 4) << 14 | exp << 4 | lgkm << 8,
     })
 }
 /// Inverse of [`waitcnt_imm`]: `(vm, exp, lgkm)`. Unused SIMM16 bits are
 /// ignored, as the hardware ignores them.
 pub fn waitcnt_fields(arch: Arch, simm16: u16) -> (u8, u8, u8) {
     match arch {
-        Arch::Gfx942 => (
+        Arch::Gfx942 | Arch::Gfx950 => (
             ((simm16 & 0xf) | ((simm16 >> 14) & 0x3) << 4) as u8,
             ((simm16 >> 4) & 0x7) as u8,
             ((simm16 >> 8) & 0xf) as u8,
@@ -632,7 +632,7 @@ impl fmt::Display for Sop1 {
 
 /// llvm's symbolic `HW_REG_*` names on gfx942 (CDNA3 ISA §5.8 Table 19 p.29;
 /// spellings as llvm prints them, checked exhaustively by the tests).
-fn hwreg_name(id: u16) -> Option<&'static str> {
+pub fn hwreg_name(id: u16) -> Option<&'static str> {
     Some(match id {
         1 => "HW_REG_MODE",
         2 => "HW_REG_STATUS",
@@ -1042,6 +1042,7 @@ impl Sop2Op {
                 Self::PackHhB32B16 => 52,
                 Self::AbsdiffI32 => 42,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -1125,6 +1126,7 @@ impl Sop1Op {
                 Self::Bitset0B32 => 24,
                 Self::Bitset1B32 => 26,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -1184,6 +1186,7 @@ impl SopkOp {
                 Self::GetregB32 => 17,
                 Self::SetregB32 => 18,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -1236,6 +1239,7 @@ impl SopcOp {
                 Self::CmpEqU64 => 18,
                 Self::CmpLgU64 => 19,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -1286,6 +1290,7 @@ impl SoppOp {
                 Self::Trap => 18,
                 Self::IcacheInv => 19,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).

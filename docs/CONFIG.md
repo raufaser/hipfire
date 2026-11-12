@@ -847,8 +847,15 @@ the same source/mode/topology; registry cards set neither backend nor
 gfx1100/gfx1151 the certified Qwen3.5-family VMM KV pairs are Q8/Q8 and, on
 exact gfx1100 TP1 only, FWHT2/3/4 K with Q8 or Lloyd2/3/4 V. Existing
 pipeline-parallel VMM restrictions still apply. Unsupported combinations
-retain the existing legacy fallback,
-except on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
+retain the existing legacy fallback.
+Automatic selection also proves the runtime can reserve address space before
+any weight is uploaded: the daemon performs one real `hipMemAddressReserve`
+of a single allocation granule per device (retired, never mapped) and, if the
+call fails, resolves **legacy** with the driver's error in the logged reason
+(on gfx1100 the Q8 FA2 split-KV verifier, which admits VMM caches only, stays
+off instead of refusing the load). An explicit `--kv-backend vmm` is refused
+at admission with the same reason and names `--kv-backend legacy` as the fix.
+Exception: on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
 selecting FWHT2/3/4 (including typed aliases) with an unset/`auto`/`q8` mode
 is refused unless `--kv-backend legacy` is explicit. There is no certified
 gfx1151 VMM FWHT path, so this refusal also applies when VMM runtime or
@@ -971,6 +978,16 @@ A -> B` line, and lowers the published context (and `card_cap`) to it; below 512
 the load is refused. An explicit `max_seq` that does not fit is refused at load,
 naming the largest fitting value; with `memory.oom_guard` off it loads and only
 warns.
+A user-terminated prompt (its render ends in a generation prompt) also snapshots the
+DeltaNet state at the newest prefill chunk end at or before its
+`<|im_start|>assistant\n` opener (the start of the chunk that holds it), in the same
+ring and regardless of the `HIPFIRE_CACHE_CKPT_INTERVAL` stride, and the ring never
+recycles the newest such snapshot. The chunk plan is not changed for it, so the
+prefill's output is unchanged. Qwen3.5-style
+templates drop the reasoning of every assistant turn before the latest user message,
+so the next user turn's re-render diverges from the stored stream at that opener; the
+turn resumes from that snapshot after any number of tool rounds instead of
+cold-prefilling the whole conversation, replaying at most one outer prefill chunk.
 Larger prefill PBS allocations are lazy: each request chooses, once per prompt,
 the widest rung that fits currently free VRAM after mapped (not virtually
 reserved) KV minus the KV the same prompt will still map (the AR, vision,
@@ -1817,7 +1834,8 @@ ranges are the schema's; every key also appears in the generated
 | `serve.continuous_batch_size` | `1` | int 1–256; number of eligible concurrent batch lanes (`1` = sequential), subject to memory admission. The runtime batch width is dynamic: it follows the lanes in flight and is not fixed at this value, and the 128-row/63-token chunk sizes are not lane limits. Env `HIPFIRE_CONTINUOUS_BATCH_SIZE`; the `serve --continuous-batch-size` flag takes the same range. |
 | `serve.batch_spec` | `true` | bool; cross-request speculative verify rows on the VMM batch route (`false` disables batched speculation only). |
 | `serve.batch_nonexact` | `false` | bool; permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. |
-| `serve.batch_sampled` | `true` | bool, applies only with `serve.vmm_batch`; admits sampled requests to the batch route only in the lane mode the singleton route selects for them. Flash-Next fn-lanes admit sampled requests with neutral penalties (AR lanes draw with the singleton AR sampler and request seed; MTP lanes verify naively, so seeded output equals the AR singleton's where logits match). `false` keeps them on the serialized singleton route. **Reproducibility:** pass a `seed` to get reproducible sampled output at C1 (or across batch compositions with `HIPFIRE_QWEN4_LANE_ROW_EXACT=seeded`; by default concurrent native-MTP output at >= 3 lanes may depend on batch composition, greedy included); with the developer lever `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY=1` (default off) unseeded sampled requests on the EP MTP lanes use the faster batched (wide) verify, so their output is distribution-equivalent but not reproducible across batch compositions; seeded and greedy requests keep the row-exact verify. |
+| `serve.batch_exact` | `off` | `off` \| `greedy` \| `seeded`; opt-in row-exactness of Flash-Next native-MTP lane batching on exact gfx1201. By default concurrent native-MTP output at >= 3 lanes may depend on which other requests share its decode steps. `greedy` makes greedy output independent of batch composition; `seeded` does that for greedy requests and for sampled requests that carry a `seed`. Either opt-in also keeps prompts of 9..=64 tokens on their own prefill tile instead of the joint EP prefill wave; `seeded` also draws sampled lanes on the host instead of the device. Trade-off: on an R9700 EP2 it measured 0.54-0.74x aggregate tok/s at C4/C8 (decode step time x1.4-x2.1; C1 unaffected). Invariance as measured (8 distinct prompts, 256 tokens, each reply at C4 / C8 / C8 with other prompts compared with the same prompt alone at C1): greedy 8 of 8 identical in every composition (5 of 8 before the prefill change); seeded sampled 6 of 8 at C8, so not yet fully invariant for sampled requests. CLI `--batch-exact` on `serve` / `run`; the environment variable `HIPFIRE_QWEN4_LANE_ROW_EXACT` (also `1`/`on`/`true` = `seeded`, `0`/`false` = `off`) is the compatibility override. |
+| `serve.batch_sampled` | `true` | bool, applies only with `serve.vmm_batch`; admits sampled requests to the batch route only in the lane mode the singleton route selects for them. Flash-Next fn-lanes admit sampled requests with neutral penalties (AR lanes draw with the singleton AR sampler and request seed; MTP lanes verify naively, so seeded output equals the AR singleton's where logits match). `false` keeps them on the serialized singleton route. **Reproducibility:** pass a `seed` to get reproducible sampled output at C1 (across batch compositions, `serve.batch_exact = seeded` narrows but does not yet close the gap, see that key; by default concurrent native-MTP output at >= 3 lanes may depend on batch composition, greedy included); with the developer lever `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY=1` (default off) unseeded sampled requests on the EP MTP lanes use the faster batched (wide) verify, so their output is distribution-equivalent but not reproducible across batch compositions; seeded and greedy requests keep the row-exact verify. |
 | `serve.ui` | `false` | bool; serve the embedded chat UI at `/ui` on the serve listener. |
 | `serve.retry_enabled` | `false` | bool; server-owned single retry on typed transient daemon failures. |
 | `serve.retry_backoff_ms` | `50` | int 0–60000; backoff before that retry. |
@@ -2318,7 +2336,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 310 schema keys, plus the `developer.<name>` namespace.
+**Count:** 311 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2562,6 +2580,7 @@ misspelled key is unknown and fails the load with
 | `serve.allow_request_paths` | `allow_request_paths` | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | stable |
 | `serve.allow_request_pull` | `allow_request_pull` | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | stable |
 | `serve.api_key_file` | `api_key_file` | `HIPFIRE_SERVE_API_KEY_FILE` | stable |
+| `serve.batch_exact` | `serve_batch_exact` | `HIPFIRE_QWEN4_LANE_ROW_EXACT` | experimental |
 | `serve.batch_nonexact` | `serve_batch_nonexact` | `HIPFIRE_SERVE_BATCH_NONEXACT` | experimental |
 | `serve.batch_sampled` | `serve_batch_sampled` | `HIPFIRE_SERVE_BATCH_SAMPLED` | experimental |
 | `serve.batch_spec` | `serve_batch_spec` | `HIPFIRE_SERVE_BATCH_SPEC` | experimental |

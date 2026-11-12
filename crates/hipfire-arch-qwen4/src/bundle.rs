@@ -3957,6 +3957,25 @@ impl Qwen4Bundle {
         }
     }
 
+    /// Lab-only: the MTP head's last one-row stock-FP8 MoE routing (raw F32
+    /// router logits `[num_experts]`, top-k ids and renormalised weights;
+    /// exact semantics on [`crate::mtp_gpu::LabHeadRouting`]). Call it right
+    /// after the head Predict step it should describe. `Ok(None)` when the
+    /// head is not a stock-FP8 MoE head (no grouped MoE scratch).
+    #[cfg(feature = "lab")]
+    pub fn mtp_lab_fp8_head_routing(
+        &self,
+        gpu: &Gpu,
+    ) -> Result<Option<crate::mtp_gpu::LabHeadRouting>, BundleError> {
+        self.mtp
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .lab_fp8_head_routing(gpu, &self.config)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     /// The last MTP step of a chain: append only its K/V and index-key cache
     /// rows (see [`MtpStep::Append`]); the next step must bring its own
     /// backbone hidden and a fresh selection.
@@ -5900,7 +5919,8 @@ impl Qwen4Bundle {
     /// is the EXACT joint prefill ([`crate::gpu_forward::ep_wave`]): the MoE once
     /// per layer over every lane's rows on the singleton's full-table route, every
     /// other stage per lane, and `policy` is replaced by the EP wave policy; each
-    /// lane is byte-equal to its serial tile. A wave the route cannot take is
+    /// lane of 65+ rows is byte-equal to its serial tile; a 9..=64-row lane is only
+    /// distribution-equivalent (it skips the wave under `serve.batch_exact`). A wave the route cannot take is
     /// refused before any launch with an `ep wave refused:` error
     /// ([`Self::ep_wave_admission`] is the same decision, host only), and the
     /// caller runs serial lane tiles instead.

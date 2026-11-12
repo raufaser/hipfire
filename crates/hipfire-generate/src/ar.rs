@@ -27,7 +27,8 @@ use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{
-    currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
+    block_terminators_while_in_tool_call, currently_in_think, ThinkOutputRouter, ToolOutputRouter,
+    ToolRouteError,
 };
 use hipfire_runtime::emit_text::{ThinkRouteEvent, ToolRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -329,6 +330,8 @@ pub fn qwen_ar_finish_route(
 /// `Ok(true)` when the filter signals Stop / EmitAndStop (decoded EOT)
 /// so the caller can break the decode loop without emitting marker text.
 /// A user stop-sequence match is reported by `stop.matched()`, not here.
+/// After a `<function=NAME>` header, a spelled-out stop marker stays in
+/// the tool text and does not end the turn.
 pub fn qwen_ar_observe_and_route(
     stdout: &mut impl std::io::Write,
     id: &str,
@@ -339,7 +342,12 @@ pub fn qwen_ar_observe_and_route(
     new_bytes: &[u8],
     visible_acc: &mut String,
 ) -> Result<bool, ToolRouteError> {
-    let (text_bytes, filter_stop) = match filter.observe(new_bytes) {
+    let action = if router.masks_builtin_terminators() {
+        filter.observe_suppressing_stops(new_bytes)
+    } else {
+        filter.observe(new_bytes)
+    };
+    let (text_bytes, filter_stop) = match action {
         FilterAction::Emit(text_bytes) => (text_bytes, false),
         FilterAction::EmitAndStop(text_bytes) => (text_bytes, true),
         FilterAction::Hold => return Ok(false),
@@ -819,12 +827,98 @@ pub fn qwen_ar_eviction_prefill_chunk_limit(
     }
 }
 
+/// Whether a decode-phase cancel of the AR route may keep the live
+/// conversation (`production_cancel_epilogue`): the validated configuration is
+/// a resident single-GPU Qwen3.5-class bundle without KV eviction/compaction,
+/// adaptive KV or a speculator (whose drafter state an AR turn does not
+/// advance).
+pub fn ar_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
+    m.pp <= 1
+        && m.eviction.is_none()
+        && m.kv_adaptive.is_none()
+        && m.speculator.is_none()
+        && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
+}
+
 pub fn ckpt_resume_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
         .ok()
         .as_deref()
         != Some("0")
 }
+/// Whether the request renders the whole conversation through the chat template
+/// (messages history + a template), as opposed to appending `prompt` to the
+/// resident session.
+pub(crate) fn full_render_path(has_history: bool, has_template: bool, jinja_enabled: bool) -> bool {
+    has_history && has_template && jinja_enabled
+}
+
+/// The context-full pre-check: reset the resident conversation to make room.
+/// Only where a reset can create room: an append path (`prompt` is added to the
+/// resident session). A full render holds the whole history in both `seq_pos` and
+/// the prompt, so after a cold prefill it occupies the same positions and the
+/// reset would only destroy the cache.
+pub(crate) fn context_full_resets(
+    no_eviction: bool,
+    full_render: bool,
+    seq_pos: usize,
+    prompt_est: usize,
+    max_tokens: usize,
+    max_seq: usize,
+) -> bool {
+    no_eviction
+        && !full_render
+        && seq_pos
+            .saturating_add(prompt_est)
+            .saturating_add(max_tokens)
+            > max_seq
+}
+
+/// Generation budget clamped to the room left after `used` tokens; with no room
+/// left it is returned unchanged so the caller's refusal reports the render that
+/// itself does not fit.
+pub(crate) fn clamp_generation_to_context(max_tokens: usize, used: usize, cap: usize) -> usize {
+    match cap.saturating_sub(used) {
+        0 => max_tokens,
+        room => max_tokens.min(room),
+    }
+}
+
+#[cfg(test)]
+mod context_guard_tests {
+    use super::*;
+
+    #[test]
+    fn full_render_never_resets_for_context_full() {
+        // 20K-token session, 12K generation ask on a 32K context: the old check
+        // wiped the conversation on every tool-result request.
+        assert!(!context_full_resets(
+            true, true, 20_173, 800, 12_288, 32_768
+        ));
+        // The append path keeps its reset where it can create room.
+        assert!(context_full_resets(
+            true, false, 20_173, 800, 12_288, 32_768
+        ));
+        // Eviction never resets; a request that fits never resets.
+        assert!(!context_full_resets(
+            false, false, 20_173, 800, 12_288, 32_768
+        ));
+        assert!(!context_full_resets(true, false, 1_000, 800, 2_048, 32_768));
+        assert!(full_render_path(true, true, true));
+        assert!(!full_render_path(false, true, true));
+        assert!(!full_render_path(true, true, false));
+    }
+
+    #[test]
+    fn generation_is_clamped_to_the_remaining_context() {
+        assert_eq!(clamp_generation_to_context(12_288, 23_000, 32_768), 9_768);
+        assert_eq!(clamp_generation_to_context(2_048, 23_000, 32_768), 2_048);
+        // No room: unchanged, so the render is refused through the existing path.
+        assert_eq!(clamp_generation_to_context(2_048, 32_768, 32_768), 2_048);
+        assert_eq!(clamp_generation_to_context(2_048, 40_000, 32_768), 2_048);
+    }
+}
+
 pub fn ckpt_interval() -> usize {
     hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
@@ -3888,7 +3982,19 @@ pub fn generate(
     // covers >= 1 byte, so byte length over-approximates the token count
     // and a byte-fit implies a token-fit. Near-boundary requests still
     // measure exactly, so reset decisions are unchanged.
+    // The rendered conversation (messages history through the chat template)
+    // already holds the whole cached history, so a reset could never create room:
+    // the full render lands on the same absolute positions after a cold prefill.
+    let full_render = full_render_path(
+        messages_history.is_some(),
+        m.chat_template.is_some(),
+        hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0"),
+    );
     let prompt_est = if m.eviction.is_none()
+        && !full_render
         && m.seq_pos
             .saturating_add(prompt.len())
             .saturating_add(20)
@@ -3910,12 +4016,14 @@ pub fn generate(
             m.seq_pos
         );
     }
-    if m.eviction.is_none()
-        && m.seq_pos
-            .saturating_add(prompt_est)
-            .saturating_add(max_tokens)
-            > m.max_seq
-    {
+    if context_full_resets(
+        m.eviction.is_none(),
+        full_render,
+        m.seq_pos,
+        prompt_est,
+        max_tokens,
+        m.max_seq,
+    ) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -4395,6 +4503,10 @@ pub fn generate(
         );
     }
     let mut cached_tokens_count: usize = 0;
+    // Position where the next user turn's re-render diverges (see
+    // `prompt_frame::user_turn_resume_boundary`); the prefill below snapshots the
+    // recurrent state at its newest chunk end at or before it.
+    let mut turn_boundary: Option<usize> = None;
     let new_tokens: Vec<u32> = if cache_eligible {
         let history = messages_history.unwrap();
         let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
@@ -4432,7 +4544,7 @@ pub fn generate(
                 &new_tokens,
                 history,
                 tools,
-                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
                 "dense-ar",
                 // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
                 Some(&m.conversation_tokens),
@@ -4516,6 +4628,11 @@ pub fn generate(
                 &rendered,
             );
         }
+        turn_boundary = hipfire_runtime::prompt_frame::user_turn_resume_boundary(
+            tokenizer,
+            messages_history,
+            &rendered,
+        );
         // LCP detection vs m.conversation_tokens.
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
@@ -4658,26 +4775,32 @@ pub fn generate(
             // invalidate the resident prefix. `seq_pos < rendered.len()` on the
             // chosen checkpoint guarantees ≥1 token is re-prefilled.
             //
-            // SAFETY INVARIANT (fix/deltanet-truncation-resume-guard): this
-            // restore-checkpoint-at-rpos + replay rendered[rpos..] is exact iff the
-            // checkpoint at rpos reflects the committed prefix rendered[..rpos].
-            // That is now enforced, not assumed:
-            //  (a) every AR checkpoint stores a prefix fingerprint over the
-            //      forwarded tokens [0..pos] it covers, and the resume below
-            //      validates it before restoring (mismatch -> cold reset);
-            //  (b) a decode-phase cancel keeps only checkpoints at or before the
-            //      cancelled request's PROMPT length and rewinds
-            //      DeltaNet/conversation to the latest such one
-            //      (`cancel_preserve_qwen35_prefix`), so a retained checkpoint
-            //      can never carry UNCOMMITTED tokens — the poison that used to
-            //      drift the non-reversible DeltaNet state into garbage;
-            //  (c) prefill-phase aborts and the explicit daemon reset /
-            //      model-swap path still full-reset;
-            //  (d) rpos <= lcp => rendered[..rpos] == conversation_tokens[..rpos]
-            //      (lcp is their longest common prefix), so hashing `rendered`
-            //      below checks exactly what is about to be re-committed to.
-            // If you ever let conversation_tokens diverge from the forwarded
-            // stream without a matching fingerprint, this resume is unsound again.
+            // SAFETY INVARIANT: this restore-checkpoint-at-rpos + replay
+            // rendered[rpos..] is exact iff the checkpoint at rpos reflects the
+            // committed prefix rendered[..rpos]. That is ATTESTED, not assumed:
+            //  (a) every checkpoint stores a fingerprint of the token stream
+            //      [0..pos] it was taken over (`take_dn_checkpoint` `prefix`:
+            //      the AR prefill/decode loops, the MTP/DFlash prompt seeds and
+            //      the VMM lanes all pass the stream they forwarded), and a
+            //      resume restores only a checkpoint whose fingerprint equals
+            //      the fingerprint of `conversation_tokens[..pos]`
+            //      (`checkpoint_prefix_attests`); an unattested or mismatching
+            //      checkpoint is skipped and the render prefills from an
+            //      earlier attested checkpoint or cold;
+            //  (b) rpos <= lcp => rendered[..rpos] == conversation_tokens[..rpos]
+            //      (lcp is their longest common prefix), so what is hashed is
+            //      exactly what the restored state is about to be extended on;
+            //  (c) a decode-phase client cancel keeps only the COMMITTED prefix
+            //      (`conversation_tokens` / `seq_pos` = prompt + fed tokens,
+            //      the sampled-but-unfed token excluded) through
+            //      `production_cancel_epilogue` / `production_cancel_epilogue_live`
+            //      (checkpoints past the kept length are freed); a boundary
+            //      the cursors cannot attest, prefill aborts, errors, explicit
+            //      resets and model swaps full-reset.
+            // A path that lets conversation_tokens diverge from the forwarded
+            // stream still cannot make a resume unsound: the fingerprints taken
+            // from the forwarded stream no longer match, so the resume degrades
+            // to a cold prefill.
             // Guarded by scripts/test-qwen35-abort-resume.sh.
             let evict_safe = m.pp <= 1
                 && m.eviction.is_none()
@@ -4706,9 +4829,32 @@ pub fn generate(
                     .as_ref()
                     .map_or(false, |s| s.as_ref().arch_key() == "qwen35")
             {
-                m.prefill_checkpoints
-                    .iter()
-                    .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
+                // Latest checkpoint at or before the LCP that leaves >=1 token to
+                // prefill AND whose stored prefix fingerprint proves it covers
+                // exactly `conversation_tokens[..pos]` (== `rendered[..pos]`,
+                // since pos <= lcp). Newest first, so only the checkpoints that
+                // are candidates get hashed.
+                let mut rejected = 0usize;
+                let found = m.prefill_checkpoints.iter().rposition(|(p, snap)| {
+                    if *p > lcp || *p >= rendered.len() {
+                        return false;
+                    }
+                    let attested = speculative::checkpoint_prefix_attests(
+                        snap.prefix_hash,
+                        *p,
+                        &m.conversation_tokens,
+                    );
+                    if !attested {
+                        rejected += 1;
+                    }
+                    attested
+                });
+                if rejected > 0 {
+                    eprintln!(
+                        "[qwen-cache resume] {rejected} newer checkpoint(s) rejected: prefix hash does not attest the conversation (lcp={lcp})"
+                    );
+                }
+                found
             } else {
                 None
             };
@@ -4821,6 +4967,11 @@ pub fn generate(
             rendered[lcp..].to_vec()
         }
     } else {
+        turn_boundary = hipfire_runtime::prompt_frame::user_turn_resume_boundary(
+            tokenizer,
+            messages_history,
+            &new_tokens,
+        );
         new_tokens
     };
 
@@ -4916,6 +5067,19 @@ pub fn generate(
             })
             .unwrap_or(0),
     );
+    // Full-render path: the generation budget is clamped to the room left in the
+    // context (decode then ends with finish_reason "length" at the cap) instead of
+    // wiping the session; only a render that itself does not fit (no room left)
+    // reaches the refusal below.
+    let max_tokens = if full_render && m.eviction.is_none() {
+        clamp_generation_to_context(
+            max_tokens,
+            m.seq_pos + new_tokens.len() + trailer,
+            m.physical_cap,
+        )
+    } else {
+        max_tokens
+    };
     let max_tokens = if m.eviction.is_none() {
         crate::common::fit_max_tokens(
             max_tokens,
@@ -5083,6 +5247,14 @@ pub fn generate(
         // does a full re-prefill from scratch, which is the same cost
         // as letting the abandoned prefill drain — but the client
         // gets control back immediately instead of waiting.
+        // The newest user-turn boundary stays pinned in the checkpoint ring
+        // until the next user turn; a tool-result request keeps the previous one.
+        // The snapshot sits on the newest existing chunk end at or before the
+        // boundary: the chunk plan is untouched (numerics-neutral).
+        let mut turn = speculative::TurnCheckpoint {
+            boundary: turn_boundary.filter(|_| ckpt_resume_enabled()),
+            pin: m.user_turn_ckpt,
+        };
         let mut prefill_aborted = false;
         if let Some(ref ev) = m.eviction {
             let window = ev.budget() + ev.beta();
@@ -5231,6 +5403,21 @@ pub fn generate(
                 let remaining = new_tokens.len() - start;
                 let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                     .unwrap_or(remaining.min(chunk_max).max(1));
+                if ckpt_resume_enabled() {
+                    speculative::take_turn_checkpoint_before_chunk(
+                        &mut m.prefill_checkpoints,
+                        dn,
+                        kv,
+                        gpu,
+                        m.seq_pos,
+                        outer,
+                        ckpt_max(),
+                        &mut turn,
+                        // Committed conversation + the chunks forwarded so far.
+                        (&m.conversation_tokens, &new_tokens[..start]),
+                    );
+                    m.user_turn_ckpt = turn.pin;
+                }
                 let end = (start + outer).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
                 if let Err(e) = qwen35::forward_prefill_batch(
@@ -5305,8 +5492,8 @@ pub fn generate(
                 // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
                 // fields, so this composes with the live kv/dn borrows.
                 if ckpt_resume_enabled() {
-                    let done = m.seq_pos.saturating_sub(base).min(new_tokens.len());
-                    speculative::take_dn_checkpoint(
+                    // Stride snapshot that spares the pinned user-turn snapshot.
+                    speculative::take_turn_checkpoint(
                         &mut m.prefill_checkpoints,
                         dn,
                         kv,
@@ -5314,7 +5501,9 @@ pub fn generate(
                         m.seq_pos,
                         ckpt_interval(),
                         ckpt_max(),
-                        Some((&m.conversation_tokens, &new_tokens[..done])),
+                        turn,
+                        // Committed conversation + the chunk forwarded so far.
+                        (&m.conversation_tokens, &new_tokens[..end]),
                     );
                 }
                 start = end;
@@ -5642,12 +5831,15 @@ pub fn generate(
             // Emit aborted+done so the CLI's drain loop terminates
             // cleanly without an extra max_tokens worth of wasted decode.
             if check_abort(id) {
-                // Drop live bundle borrows before the rollback. Tokens past
-                // the prompt are uncommitted and never survive: the cancel
-                // path rewinds DN + conversation to a hash-attested checkpoint
-                // at or before the prompt length, or full-resets (fail closed).
+                // Drop live bundle borrows before the epilogue. At this loop
+                // top every fed token is already committed (`conversation_tokens`
+                // / `seq_pos`), the sampled `next_token` is not yet fed: the
+                // state is a committed prefix, kept for the next request when
+                // the configuration is the validated one; else the full
+                // fail-closed reset. Terminal is aborted+done only when attested.
                 let _ = (kv, dn, weights, config, scratch);
-                let ep = cancel_preserve_qwen35_prefix(m, gpu, ngram_scope_start);
+                let eligible = ar_cancel_keeps_committed_prefix(m);
+                let ep = crate::common::production_cancel_epilogue(m, gpu, eligible);
                 crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
             }
@@ -5841,16 +6033,7 @@ pub fn generate(
             // render diverges within it — without replaying the whole
             // generation. No-op under eviction (compact_offset != 0).
             if ckpt_resume_enabled() {
-                // `conversation_tokens` IS the forwarded stream here; under
-                // eviction `seq_pos` is physical and no resume/cancel path
-                // reads these checkpoints (`evict_safe` gates both).
-                debug_assert!(
-                    m.eviction.is_some() || m.seq_pos == m.conversation_tokens.len(),
-                    "decode checkpoint: seq_pos={} != conversation_tokens.len()={}",
-                    m.seq_pos,
-                    m.conversation_tokens.len()
-                );
-                speculative::take_dn_checkpoint(
+                speculative::take_dn_checkpoint_pinned(
                     &mut m.prefill_checkpoints,
                     dn,
                     kv,
@@ -5858,7 +6041,12 @@ pub fn generate(
                     m.seq_pos,
                     ckpt_interval(),
                     ckpt_max(),
-                    Some((&m.conversation_tokens, &[][..])),
+                    m.user_turn_ckpt,
+                    // `conversation_tokens` IS the forwarded stream here (each
+                    // token is committed as it is forwarded); under eviction
+                    // `seq_pos` is physical, the lengths differ and the
+                    // snapshot stays unattested.
+                    (&m.conversation_tokens, &[]),
                 );
             }
             if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
@@ -5906,16 +6094,17 @@ pub fn generate(
             }
 
             // Below `min_tokens` the sampled EOS is an ordinary token.
-            if semantic.last_stops_active {
-                if next_token == config.eos_token {
-                    break;
-                }
-                if im_end_token == Some(next_token) {
-                    break;
-                }
-                if tokenizer.is_terminator(next_token) {
-                    break;
-                }
+            // Once a tool span has a `<function=NAME>` header it keeps
+            // going through EOS, <|im_end|>, and <|endoftext|>. A bare
+            // `<tool_call>` still ends the turn. User stops return above;
+            // the loop bound is the token budget.
+            let end_on_terminator = semantic.last_stops_active
+                && !semantic.router.masks_builtin_terminators()
+                && (next_token == config.eos_token
+                    || im_end_token == Some(next_token)
+                    || tokenizer.is_terminator(next_token));
+            if end_on_terminator {
+                break;
             }
 
             // max_think_tokens enforcement. Track whether we're inside an
@@ -6143,6 +6332,14 @@ pub fn generate(
                         2,
                         &mut blocked,
                     );
+                    block_terminators_while_in_tool_call(
+                        &mut blocked,
+                        semantic.router.masks_builtin_terminators(),
+                        [config.eos_token, tokenizer.eos_id]
+                            .into_iter()
+                            .chain(im_end_token)
+                            .chain(tokenizer.eot_id),
+                    );
                     let cfg = SamplerConfig {
                         temperature: temp,
                         top_p,
@@ -6313,6 +6510,14 @@ pub fn generate(
                     blocked.push(t);
                 }
             }
+            block_terminators_while_in_tool_call(
+                &mut blocked,
+                semantic.router.masks_builtin_terminators(),
+                [config.eos_token, tokenizer.eos_id]
+                    .into_iter()
+                    .chain(im_end_token)
+                    .chain(tokenizer.eot_id),
+            );
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,
@@ -6488,7 +6693,10 @@ pub fn generate(
         let effects =
             crate::qwen::qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
-            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            // The turn finished and every fed token is committed: the client
+            // leaving before `done` keeps the prefix like a decode cancel.
+            let eligible = ar_cancel_keeps_committed_prefix(m);
+            let ep = crate::common::production_cancel_epilogue(m, gpu, eligible);
             crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
@@ -6703,6 +6911,8 @@ pub fn generate(
         // strip-think, byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
+        // Same reasoning/content split as the DFlash/DSpark emitter.
+        let mut think = ThinkOutputRouter::new(started_in_think);
 
         let mut hit_stop = false;
         for _ in 0..max_tokens {
@@ -6732,20 +6942,13 @@ pub fn generate(
                 || tokenizer.is_terminator(next_token);
             let fed = stream_bytes.len();
             tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
-            let new_bytes = &stream_bytes[fed..];
-            let action = if is_stop {
-                FilterAction::Hold
-            } else {
-                filter.observe(new_bytes)
-            };
-            if let FilterAction::Emit(text_bytes) = action {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
+            if !is_stop {
+                crate::vision::vl_route_decode_text(
                     stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
                     id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
+                    &mut filter,
+                    &mut think,
+                    &stream_bytes[fed..],
                 );
                 let _ = stdout.flush();
             }
@@ -6824,6 +7027,8 @@ pub fn generate(
             rng_state = rng;
         }
         m.seq_pos += generated;
+        crate::vision::vl_finish_think_routing(stdout, id, &mut filter, &mut think);
+        let open_think = think.in_think();
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
@@ -6882,6 +7087,7 @@ pub fn generate(
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+            "cached_tokens": cached_tokens_count,
             "finish_reason": if hit_stop { "stop" } else { "length" },
             "attempt_id": active_attempt_id(),
         });
@@ -6896,7 +7102,24 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
+            ClientTerminalDecision::Commit => {
+                // Same store decision as the legacy spec route.
+                let decoded_full = tokenizer.decode(&streamed_tokens);
+                let action = crate::qwen::legacy_asst_turn_action(
+                    !hit_stop,
+                    open_think,
+                    started_in_think,
+                    &decoded_full,
+                    &[],
+                );
+                if action.store {
+                    let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
+                    let cached_seq =
+                        crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+                    crate::qwen::store_legacy_asst_turn(m, &action, cached_seq);
+                }
+                emit_active_route_done(stdout, id, &pending_done)
+            }
             ClientTerminalDecision::Abort => {
                 // Abort after commit: full fail-closed rollback first, then
                 // the attested aborted+done pair (or a single unattested

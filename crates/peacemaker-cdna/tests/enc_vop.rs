@@ -216,6 +216,7 @@ fn cases() -> Vec<Inst> {
             Vop2Op::AddU16
             | Vop2Op::SubU16
             | Vop2Op::LshlrevB16
+            | Vop2Op::LshrrevB16
             | Vop2Op::AshrrevI16
             | Vop2Op::MulLoU16 => (Lit(0xfff0), Lit(0x40)),
             _ => (Lit(0x1234_5678), Lit(0xffff_fff0)),
@@ -742,6 +743,45 @@ fn round_trip_against_llvm() {
 }
 
 #[test]
+fn integer16_signed_literals_keep_the_full_encoded_dword() {
+    let mut texts = Vec::new();
+    let mut bytes = Vec::new();
+    for op in [
+        Vop2Op::AddU16,
+        Vop2Op::SubU16,
+        Vop2Op::LshlrevB16,
+        Vop2Op::LshrrevB16,
+        Vop2Op::AshrrevI16,
+        Vop2Op::MulLoU16,
+    ] {
+        for value in [-1i32, -16, -256, -32768] {
+            let inst = i2(op, Vgpr(0), Lit(value as u32), Vgpr(1), VopExt::None);
+            let words = inst.words(A).expect("signed16 literal encodes");
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[1], value as u32, "never truncate or normalize");
+            assert_eq!(Inst::decode(A, &words).unwrap(), (inst.clone(), 2));
+            assert!(inst.to_string().contains(&format!("lit({value})")));
+            texts.push(inst.to_string());
+            bytes.push(oracle::bytes(&words));
+        }
+        for value in [0x1_0000, 0xffff_0000, 0xffff_7fff] {
+            assert!(i2(op, Vgpr(0), Lit(value), Vgpr(1), VopExt::None)
+                .words(A)
+                .is_err());
+        }
+    }
+    if !oracle::disabled() {
+        // LLVM prints a masked halfword even for a sign-extended raw literal.
+        // Compare the assembled bytes of our lossless signed spelling, not that
+        // lossy pretty-print. The ordinary canonical corpus still checks both.
+        let encoded = oracle::mc_encode(A, &texts).unwrap();
+        for ((_, actual), expected) in encoded.iter().zip(&bytes) {
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
 fn illegal_forms_rejected() {
     let n = VopExt::None;
     let s = sdwa();
@@ -1020,31 +1060,97 @@ fn illegal_forms_rejected() {
         );
     }
 
-    let reject = [
+    // Malformed encodings: reserved bit patterns, a value the ISA reserves, an
+    // encoding with no row, a truncated instruction. Neither the typed model
+    // nor the generated-table fallback may decode them.
+    let malformed = [
         vec![0x7e02_02fa, 0xff01_0002], // DPP_CTRL 0x100 (reserved)
-        vec![0x7e02_02fa, 0xff01_5002], // row_newbcast (not modelled)
         vec![0x7e02_02fa, 0xff06_e402], // DPP reserved bits [50:49]
         vec![0x7e02_02f9, 0x0007_0602], // SDWA src0_sel 7
         vec![0x7e02_02f9, 0x0006_1e02], // DST_UNUSED 3
+        vec![0x7d94_06fa, 0xff00_e402], // VOPC DPP
+        vec![0x7e02_c800],              // VOP1 opcode 100: not in table
+        vec![0x7e02_02ff],              // literal missing
+    ];
+    // Encodings the generated tables describe that the typed model refuses by
+    // construction (a DPP control it does not model, a non-canonical or
+    // unverified form, a register the typed operand rules exclude). The typed
+    // decoder stays strict; `Inst::decode` falls back to a generated
+    // instruction that is refused by name everywhere without a model.
+    let unmodelled = [
+        vec![0x7e02_02fa, 0xff01_5002], // row_newbcast (not modelled)
         vec![0x7e02_02f9, 0x0606_0602], // VOP1 SDWA with src1 fields
         vec![0x7e02_02f9, 0x0016_0602], // v_mov_b32 SDWA neg (int source)
         vec![0x7e02_a8f9, 0x0003_0002], // fp8 SDWA dst_sel BYTE_0
         vec![0x7d94_06f9, 0x0400_6a02], // VOPC SDWA SD=0 with SDST bits
         vec![0x7d94_06f9, 0x0400_ea02], // VOPC SDWA SD=1 SDST=VCC (non-canonical)
-        vec![0x7d94_06fa, 0xff00_e402], // VOPC DPP
         vec![0x7e00_0001],              // v_nop with a nonzero field
         vec![0x7ef8_0502],              // v_readfirstlane_b32 m0
-        vec![0x7e02_c800],              // VOP1 opcode 100: not in table
-        vec![0x7e02_02ff],              // literal missing
-        vec![0x0002_0702 | 4 << 25],    // VOP2 opcode 4: not in table
     ];
-    for words in &reject {
+
+    // The typed decoders refuse every one of them.
+    let typed = |words: &[u32]| -> Result<(), String> {
+        match words[0] >> 25 {
+            0b011_1111 => Vop1::decode(A, words).map(drop),
+            0b011_1110 => Vopc::decode(A, words).map(drop),
+            _ => Vop2::decode(A, words).map(drop),
+        }
+    };
+    for words in malformed.iter().chain(&unmodelled) {
+        assert!(
+            typed(words).is_err(),
+            "typed decoder accepted {words:#010x?}"
+        );
+    }
+
+    for words in &malformed {
         assert!(
             Inst::decode(A, words).is_err(),
-            "decoded {words:#010x?} as {:?}",
+            "decoded malformed {words:#010x?} as {:?}",
             Inst::decode(A, words)
         );
     }
+
+    // A legal form the typed model does not represent is never a typed
+    // instruction: it is refused, or carried as a generated instruction that
+    // spans the whole input and is refused by name.
+    for words in &unmodelled {
+        match Inst::decode(A, words) {
+            Err(_) => {}
+            Ok((inst, n)) => {
+                let Some(x) = inst.xml() else {
+                    panic!("typed instruction decoded from unmodelled {words:#010x?}: {inst:?}")
+                };
+                assert_eq!(n, words.len(), "{words:#010x?} decoded as {inst:?}");
+                let why = inst
+                    .unsupported()
+                    .expect("generated instruction is unsupported");
+                assert!(
+                    why.contains(x.name()) && why.contains("no hand-written model"),
+                    "{words:#010x?}: unsupported text {why:?}"
+                );
+            }
+        }
+    }
+
+    // row_newbcast is a legal gfx942 DPP control: it decodes to the generated
+    // v_mov_b32 DPP row, named in the refusal, with its control preserved.
+    let newbcast = [0x7e02_02fa, 0xff01_5002];
+    let (inst, n) = Inst::decode(A, &newbcast).expect("row_newbcast decodes as a generated row");
+    assert_eq!(n, 2);
+    let x = inst
+        .xml()
+        .unwrap_or_else(|| panic!("row_newbcast decoded as a typed instruction: {inst:?}"));
+    assert_eq!(x.name(), "v_mov_b32");
+    assert_eq!(x.encoding(), "VOP1_VOP_DPP");
+    assert_eq!(x.field("DPP_CTRL"), Some(0x150));
+    let why = inst
+        .unsupported()
+        .expect("generated instruction is unsupported");
+    assert!(
+        why.contains("v_mov_b32") && why.contains("no hand-written model"),
+        "unsupported text {why:?}"
+    );
 }
 
 #[test]
