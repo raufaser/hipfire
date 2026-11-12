@@ -93,13 +93,8 @@ __device__ __forceinline__ gk_bfrag gk_frag_global(
         u.h[e+4] = p[(unsigned)row*row_stride + kh+8+e];
     }
 #else
-    // Sixteen halves as two 16-byte loads: k0 is a multiple of 16 halves, so
-    // the 32-byte offset stays aligned off the 256-byte row base.
-    const unsigned off=(unsigned)row*row_stride+k0*2u;
-    union { uint4 w[2]; gk_bfrag v; } u2;
-    u2.w[0]=*reinterpret_cast<const uint4*>(p+off);
-    u2.w[1]=*reinterpret_cast<const uint4*>(p+off+16u);
-    u.v=u2.v;
+#pragma unroll
+    for (int e=0;e<16;++e) u.h[e] = p[(unsigned)row*row_stride + k0+e];
 #endif
     return u.v;
 }
