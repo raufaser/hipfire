@@ -10,8 +10,10 @@
 // the same pinned fold, so the output is bit-identical to the gfx12 route
 // and to the CPU reference in
 // `crates/hipfire-runtime/examples/a8_gfx11_oracle.rs`:
-//   C   = sum_k (q - 8) * x8       per (row, token, K128), integer-exact
-//   acc = fma(RN(sc * d), (float)C, acc)   per K128 block, in K order
+//   C   = sum_k q * x8             per (row, token, K128), integer-exact
+//   acc = fma(RN(sc * d), (float)C, acc) + zp * d * s   per K128 block, in
+//         K order, with (sc, zp) the raw group-header half2 and s = sum x8
+//         (affine zero-point: exact for any stored zp, not just -8*sc)
 //
 // CTA tile I8_TILE x I8_TILE (weight rows x tokens), I8_TILE = 128 (16
 // waves, entries named as on gfx12) or 256 (32 waves, entries suffixed
@@ -36,10 +38,11 @@
 // byte order of the activations, so no byte shuffle exists in the K loop.
 // (Packed, the 256 tile fits the 64 KB workgroup LDS limit and the weight
 // plane costs half the LDS bytes.) Codes enter the WMMA raw and UNSIGNED
-// (0..15) against signed int8 activations; the -8 * s zero-point term rides
-// in the chain seed (I8_MAGIC - 8 * s per token), and the fold reads
-// fc = as_float(C) - 12582912.0f, exact for
-// |sum| <= 15 * 127 * 128 + 8 * 127 * 128 < 2^22.
+// (0..15) against signed int8 activations with a plain I8_MAGIC chain seed;
+// the fold reads fc = as_float(C) - 12582912.0f, exact for
+// |sum| <= 15 * 127 * 128 < 2^22. The affine zero-point term zp * d * s
+// (s = exact int code-sum, d the token scale) is a second FMA in the fold —
+// it replaced the old seed-borne -8 * s, which assumed zp == -8 * sc.
 //
 // LDS (I8_LDS_BYTES): two slots of one K64 slab each,
 //   A_s [I8_TILE tokens][64 B]: 16-byte chunk c of token e at chunk
@@ -47,9 +50,10 @@
 //   W_s [I8_TILE rows][32 B]: 8-byte step c of row e at step c ^ ((e >> 2) & 3)
 //       (b64 reads conflict-free per 16 lanes),
 // then per-K128 parity planes
-//   DS_p: seed[I8_TILE] i32 + d[I8_TILE] f32 in the C-row order
+//   DS_p: (d*s)[I8_TILE] f32 + d[I8_TILE] f32 in the C-row order
 //         p(t) = (t & ~15) | ((t & 1) << 3) | ((t >> 1) & 7),
-//   SZ_p: sc[I8_TILE] f32 (weight row scale of the K128 half).
+//   SZ_p: (sc, zp)[I8_TILE] raw u32 half2 (weight row header of the K128
+//         half, unpacked in the fold).
 // Every staging map has one thread per (token, 16-byte chunk) and per (row,
 // 8-byte step) because I8_TILE == threads / 4. Two K64 slabs per K128 run
 // as a register-prefetched ring with one barrier per slab.
@@ -245,13 +249,14 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
         hs_pf = *(const unsigned*)(hdr_sp + (kb >> 1) * 136 + (kb & 1) * 4);
     };
     auto publish_hdr = [&](int par) {
-        // Tokens >= N read d = 0, s = 0 (descriptor bound).
-        int* seed = (int*)(LDS + I8_DS_OFF + par * I8_DS_BYTES);
+        // Tokens >= N read d = 0, s = 0 (descriptor bound), so d*s = 0.
+        float* dsp = (float*)(LDS + I8_DS_OFF + par * I8_DS_BYTES);
         float* dd = (float*)(LDS + I8_DS_OFF + par * I8_DS_BYTES + I8_TILE * 4);
-        float* sz = (float*)(LDS + I8_SZ_OFF + par * I8_SZ_BYTES);
-        seed[hdr_ds] = I8_MAGIC - 8 * (int)hd_pf.y;
-        dd[hdr_ds] = __uint_as_float(hd_pf.x);
-        sz[hdr_i] = __half2float(__ushort_as_half((unsigned short)(hs_pf & 0xFFFFu)));
+        unsigned* sz = (unsigned*)(LDS + I8_SZ_OFF + par * I8_SZ_BYTES);
+        const float d = __uint_as_float(hd_pf.x);
+        dsp[hdr_ds] = d * (float)(int)hd_pf.y;
+        dd[hdr_ds] = d;
+        sz[hdr_i] = hs_pf;  // raw half2 {sc, zp}
     };
 
     // One packed K16 weight step -> the B operand {lo(pk0), hi(pk0), lo(pk1),
@@ -307,15 +312,13 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
         // The last block refetches itself into dead planes (no reader after
         // the final barrier): the body stays one basic block.
         const int kn = (kb + 1 == kblocks) ? kb : kb + 1;
-        // Chain seeds: I8_MAGIC - 8 * s per C row (token).
+        // Chain seed: plain I8_MAGIC (the affine zp term rides in the fold;
+        // the old seed-borne -8 * s assumed zp == -8 * sc).
         {
-            const int* seed = (const int*)(LDS + I8_DS_OFF + par * I8_DS_BYTES)
-                + wave_tok0 + hi * 8;
+            const int32x8_t sv = {I8_MAGIC, I8_MAGIC, I8_MAGIC, I8_MAGIC,
+                                  I8_MAGIC, I8_MAGIC, I8_MAGIC, I8_MAGIC};
             #pragma unroll
             for (int nb = 0; nb < I8_NB; nb++) {
-                const int32x4_t s0 = *(const int32x4_t*)(seed + nb * 16);
-                const int32x4_t s1 = *(const int32x4_t*)(seed + nb * 16 + 4);
-                const int32x8_t sv = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
                 cacc[nb][0] = sv;
                 cacc[nb][1] = sv;
             }
@@ -332,18 +335,28 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
         fetch_slab(kn, 0);
         compute_slab(1);
         pin_chains();
-        // Fold this K128 block: acc = fma(RN(sc * d), as_float(C) - magic, acc).
+        // Fold this K128 block: acc = fma(RN(sc * d), as_float(C) - magic,
+        // acc) + zp * (d * s); (sc, zp) = the row's raw header half2.
         {
+            const float* dsp = (const float*)(LDS + I8_DS_OFF + par * I8_DS_BYTES)
+                + wave_tok0 + hi * 8;
             const float* dd = (const float*)(LDS + I8_DS_OFF + par * I8_DS_BYTES + I8_TILE * 4)
                 + wave_tok0 + hi * 8;
-            const float* sz = (const float*)(LDS + I8_SZ_OFF + par * I8_SZ_BYTES)
+            const unsigned* szr = (const unsigned*)(LDS + I8_SZ_OFF + par * I8_SZ_BYTES)
                 + wave_row0 + l16;
-            const float sc[2] = {sz[0], sz[16]};
+            const unsigned raw[2] = {szr[0], szr[16]};
+            const float sc[2] = {__half2float(__ushort_as_half((unsigned short)(raw[0] & 0xFFFFu))),
+                                 __half2float(__ushort_as_half((unsigned short)(raw[1] & 0xFFFFu)))};
+            const float zp[2] = {__half2float(__ushort_as_half((unsigned short)(raw[0] >> 16))),
+                                 __half2float(__ushort_as_half((unsigned short)(raw[1] >> 16)))};
             #pragma unroll
             for (int nb = 0; nb < I8_NB; nb++) {
                 float d8[8];
                 *(float4*)(d8) = *(const float4*)(dd + nb * 16);
                 *(float4*)(d8 + 4) = *(const float4*)(dd + nb * 16 + 4);
+                float ds8[8];
+                *(float4*)(ds8) = *(const float4*)(dsp + nb * 16);
+                *(float4*)(ds8 + 4) = *(const float4*)(dsp + nb * 16 + 4);
                 #pragma unroll
                 for (int rg = 0; rg < 2; rg++) {
                     #pragma unroll
@@ -353,7 +366,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
                         // of an ext-vector element lvalue to element 0.
                         const int c = cacc[nb][rg][l];
                         const float fc = __int_as_float(c) - 12582912.0f;
-                        acc[nb][rg][l] = __builtin_fmaf(t1, fc, acc[nb][rg][l]);
+                        acc[nb][rg][l] = __builtin_fmaf(zp[rg], ds8[l],
+                                                        __builtin_fmaf(t1, fc, acc[nb][rg][l]));
                     }
                 }
             }

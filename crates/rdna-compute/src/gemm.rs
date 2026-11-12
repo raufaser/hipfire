@@ -22888,13 +22888,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.flush_residual_fold()?;
+        // The gfx11 kernel folds the affine zp term (any stored zp); the
+        // gfx12 kernel keeps the symmetric seed-borne fold (zp == -8*sc).
         let Some((module, source, threads, lds, tile)) =
-            a8_launch(&self.arch, m, n, self.cu_count_or_default())
-                .filter(|_| self.mq4v2_symmetric && k != 0 && k % 256 == 0)
+            a8_launch(&self.arch, m, n, self.cu_count_or_default()).filter(|_| {
+                (self.arch != "gfx1201" || self.mq4v2_symmetric) && k != 0 && k % 256 == 0
+            })
         else {
             return Err(hip_bridge::HipError::new(
                 1,
-                "A8 MMQ requires symmetric MQ4v2, gfx1100/gfx1151/gfx1201 and K%256=0",
+                "A8 MMQ requires symmetric MQ4v2 on gfx1201, gfx1100/gfx1151/gfx1201 and K%256=0",
             ));
         };
         let kernel = match (add, tile) {
@@ -23267,13 +23270,19 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        // The gfx11 kernel folds the affine zp term (any stored zp); the
+        // gfx12 kernel keeps the symmetric seed-borne fold (zp == -8*sc).
         let Some((module, source, threads, lds, tile)) =
-            a8_launch(&self.arch, 2 * m, n, self.cu_count_or_default())
-                .filter(|_| self.mq4v2_symmetric && m != 0 && m % 128 == 0 && k % 256 == 0)
+            a8_launch(&self.arch, 2 * m, n, self.cu_count_or_default()).filter(|_| {
+                (self.arch != "gfx1201" || self.mq4v2_symmetric)
+                    && m != 0
+                    && m % 128 == 0
+                    && k % 256 == 0
+            })
         else {
             return Err(hip_bridge::HipError::new(
                 1,
-                "A8 gate/up requires symmetric MQ4v2, gfx1100/gfx1151/gfx1201, M%128=K%256=0",
+                "A8 gate/up requires symmetric MQ4v2 on gfx1201, gfx1100/gfx1151/gfx1201, M%128=K%256=0",
             ));
         };
         self.bind_thread()?;

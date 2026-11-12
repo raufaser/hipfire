@@ -6053,7 +6053,12 @@ impl Gpu {
     /// producers must not depend on the row count.
     pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
         self.flags.a8_prefill_enabled()
-            && self.mq4v2_symmetric
+            // gfx12 A8 folds a symmetric zero point (zp == -8*sc) into the
+            // chain seed; the gfx11 kernel carries the affine zp term in the
+            // fold (gemm_mq4g256v2_residual_mmq_i8.gfx11.hip), so it admits
+            // asymmetric files too (2026-11-05 symmetry probe: the old
+            // requirement was a correctness gate, now satisfied by the fold).
+            && (self.flags.arch != "gfx1201" || self.mq4v2_symmetric)
             && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
