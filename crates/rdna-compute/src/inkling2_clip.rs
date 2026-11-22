@@ -353,7 +353,7 @@ mod gpu_tests {
     /// (Q 24x128 scaled, K 8x128 scaleless, R 8x16 scaled) and on a
     /// randomized case. Bar: <= 1e-4 abs.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1201 and the HIP toolchain"]
     fn gpu_matches_cpu_reference() {
         let mut gpu = match crate::gpu_test::init() {
             Ok(g) => g,
@@ -362,7 +362,11 @@ mod gpu_tests {
                 return;
             }
         };
-        assert_eq!(gpu.arch, "gfx1100");
+        assert!(
+            gpu.arch == "gfx1100" || gpu.arch == "gfx1201",
+            "unexpected arch {}",
+            gpu.arch
+        );
         let mut s = 0x2468_ace0_1357_9bdfu64;
         // (a) model dims: Q heads with scale, K heads scaleless, R scaled.
         let cur: Vec<f32> = (0..24 * 128).map(|_| rng_f32(&mut s, -3.0, 3.0)).collect();

@@ -469,7 +469,7 @@ mod gpu_tests {
     /// (n_embd 2304, 5 bank blocks + cur, 2 query rows) and on a randomized
     /// case. Bar: <= 1e-5 abs.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1201 and the HIP toolchain"]
     fn gpu_matches_cpu_reference() {
         let mut gpu = match crate::gpu_test::init() {
             Ok(g) => g,
@@ -478,7 +478,11 @@ mod gpu_tests {
                 return;
             }
         };
-        assert_eq!(gpu.arch, "gfx1100");
+        assert!(
+            gpu.arch == "gfx1100" || gpu.arch == "gfx1201",
+            "unexpected arch {}",
+            gpu.arch
+        );
         assert_eq!(INKLING2_MIX_EPS, INKLING2_CONTROL_EPS);
         // (a) model dims.
         let (n_embd, n_blocks, query_rows) = (2304usize, 5usize, 2usize);

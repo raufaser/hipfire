@@ -555,7 +555,7 @@ mod gpu_tests {
     /// Gate: device output matches the crate F32 reference at model dims
     /// (n_embd 2304, rank 64) and on a randomized case. Bar: <= 1e-4 abs.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1201 and the HIP toolchain"]
     fn gpu_matches_cpu_reference() {
         let mut gpu = match crate::gpu_test::init() {
             Ok(g) => g,
@@ -564,7 +564,11 @@ mod gpu_tests {
                 return;
             }
         };
-        assert_eq!(gpu.arch, "gfx1100");
+        assert!(
+            gpu.arch == "gfx1100" || gpu.arch == "gfx1201",
+            "unexpected arch {}",
+            gpu.arch
+        );
         // (a) model dims, synthetic data.
         let (n_embd, rank) = (2304usize, 64usize);
         let mut s = 0x9e37_79b9_7f4a_7c15u64;
